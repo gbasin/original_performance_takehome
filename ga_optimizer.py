@@ -71,6 +71,7 @@ class Genome:
     # Vectorization (VLEN = 8)
     vectorize_batch: bool = False      # Process VLEN batch elements together
     vectorize_hash: bool = False       # Vectorize hash computation
+    pipeline_depth: int = 1            # Number of vector iterations to overlap (1-4)
 
     # Scheduling hints
     schedule_strategy: ScheduleStrategy = ScheduleStrategy.GREEDY
@@ -91,6 +92,7 @@ class Genome:
         self.round_unroll_factor = max(1, min(16, self.round_unroll_factor))
         self.max_bundle_fill = max(0.05, min(1.0, self.max_bundle_fill))  # Allow very low for safe mode
         self.load_ahead_distance = max(0, min(10, self.load_ahead_distance))
+        self.pipeline_depth = max(1, min(4, self.pipeline_depth))  # 1-4 iterations overlapped
 
 
 def random_genome() -> Genome:
@@ -99,10 +101,11 @@ def random_genome() -> Genome:
         batch_unroll_factor=random.choice([1, 2, 4, 8]),
         round_unroll_factor=random.choice([1, 2, 4, 8, 16]),
         loop_order=random.choice(list(LoopOrder)),
-        vectorize_batch=False,  # Disable for now - needs gather support
+        vectorize_batch=True,  # Enable vectorization (8x speedup)
         vectorize_hash=random.choice([True, False]),
+        pipeline_depth=random.choice([1, 2]),  # Overlap multiple iterations
         schedule_strategy=random.choice(list(ScheduleStrategy)),
-        max_bundle_fill=random.uniform(0.5, 1.0),  # Dependency-aware scheduling enabled
+        max_bundle_fill=random.uniform(0.8, 1.0),  # High fill for dependency-aware scheduling
         load_ahead_distance=random.randint(0, 5),
         scratch_allocation=random.choice(list(ScratchAllocation)),
         preload_constants=random.choice([True, False]),
@@ -117,7 +120,7 @@ def baseline_genome() -> Genome:
         batch_unroll_factor=1,
         round_unroll_factor=1,
         loop_order=LoopOrder.ROUND_BATCH,
-        vectorize_batch=False,
+        vectorize_batch=True,  # Enable vectorization
         vectorize_hash=False,
         schedule_strategy=ScheduleStrategy.GREEDY,
         max_bundle_fill=1.0,  # Use dependency-aware scheduling
@@ -525,15 +528,20 @@ class ParameterizedKernelBuilder:
         self.instrs.append({"flow": [("pause",)]})
 
         # Allocate per-iteration scratch
+        v_idx = v_val = v_node_val = v_tmp1 = v_tmp2 = v_const_a = v_const_b = 0
+        vec_base_addr = vec_tmp_addr = 0
+
         if genome.vectorize_batch:
             # Vector registers for batch processing
             v_idx = self.alloc_vector_scratch("v_idx")
             v_val = self.alloc_vector_scratch("v_val")
             v_node_val = self.alloc_vector_scratch("v_node_val")
-            v_addr = self.alloc_vector_scratch("v_addr")
             v_tmp1 = self.alloc_vector_scratch("v_tmp1")
             v_tmp2 = self.alloc_vector_scratch("v_tmp2")
-            v_tmp3 = self.alloc_vector_scratch("v_tmp3")
+            v_const_a = self.alloc_vector_scratch("v_const_a")  # Reusable for broadcasts
+            v_const_b = self.alloc_vector_scratch("v_const_b")
+            vec_base_addr = self.alloc_scratch("vec_base_addr")
+            vec_tmp_addr = self.alloc_scratch("vec_tmp_addr")
 
         # Scalar registers (also needed for vector case)
         tmp_idx = self.alloc_scratch("tmp_idx")
@@ -560,6 +568,10 @@ class ParameterizedKernelBuilder:
 
         round_iters = rounds // round_unroll
 
+        # Vector scratch tuple for passing to loop functions
+        vec_scratch = (v_idx, v_val, v_node_val, v_tmp1, v_tmp2, v_const_a, v_const_b,
+                       vec_tmp_addr, vec_base_addr)
+
         # Generate loop body based on loop order
         if genome.loop_order == LoopOrder.ROUND_BATCH:
             self._emit_round_batch_loop(
@@ -568,7 +580,7 @@ class ParameterizedKernelBuilder:
                 tmp_idx, tmp_val, tmp_node_val, tmp_addr,
                 tmp1, tmp2, tmp3,
                 zero_const, one_const, two_const,
-                genome
+                genome, vec_scratch
             )
         else:
             self._emit_batch_round_loop(
@@ -577,7 +589,7 @@ class ParameterizedKernelBuilder:
                 tmp_idx, tmp_val, tmp_node_val, tmp_addr,
                 tmp1, tmp2, tmp3,
                 zero_const, one_const, two_const,
-                genome
+                genome, vec_scratch
             )
 
         # Final pause
@@ -591,9 +603,11 @@ class ParameterizedKernelBuilder:
         tmp_idx, tmp_val, tmp_node_val, tmp_addr,
         tmp1, tmp2, tmp3,
         zero_const, one_const, two_const,
-        genome
+        genome, vec_scratch
     ):
         """Emit loop with rounds as outer loop"""
+        v_idx, v_val, v_node_val, v_tmp1, v_tmp2, v_const_a, v_const_b, vec_tmp_addr, vec_base_addr = vec_scratch
+
         for r_base in range(0, rounds, round_unroll):
             for r_offset in range(round_unroll):
                 r = r_base + r_offset
@@ -608,8 +622,10 @@ class ParameterizedKernelBuilder:
 
                         if genome.vectorize_batch and batch_step == VLEN:
                             self._emit_vectorized_iteration(
-                                r, b, tmp1, tmp2, tmp3,
-                                zero_const, one_const, two_const
+                                r, b,
+                                zero_const, one_const, two_const,
+                                v_idx, v_val, v_node_val, v_tmp1, v_tmp2,
+                                v_const_a, v_const_b, vec_tmp_addr, vec_base_addr
                             )
                         else:
                             self._emit_scalar_iteration(
@@ -624,9 +640,11 @@ class ParameterizedKernelBuilder:
         tmp_idx, tmp_val, tmp_node_val, tmp_addr,
         tmp1, tmp2, tmp3,
         zero_const, one_const, two_const,
-        genome
+        genome, vec_scratch
     ):
         """Emit loop with batch as outer loop"""
+        v_idx, v_val, v_node_val, v_tmp1, v_tmp2, v_const_a, v_const_b, vec_tmp_addr, vec_base_addr = vec_scratch
+
         for b_base in range(0, batch_size, batch_unroll * batch_step):
             for b_offset in range(batch_unroll):
                 b = b_base + b_offset * batch_step
@@ -641,8 +659,10 @@ class ParameterizedKernelBuilder:
 
                         if genome.vectorize_batch and batch_step == VLEN:
                             self._emit_vectorized_iteration(
-                                r, b, tmp1, tmp2, tmp3,
-                                zero_const, one_const, two_const
+                                r, b,
+                                zero_const, one_const, two_const,
+                                v_idx, v_val, v_node_val, v_tmp1, v_tmp2,
+                                v_const_a, v_const_b, vec_tmp_addr, vec_base_addr
                             )
                         else:
                             self._emit_scalar_iteration(
@@ -726,95 +746,90 @@ class ParameterizedKernelBuilder:
 
     def _emit_vectorized_iteration(
         self, round_idx: int, batch_idx: int,
-        tmp1, tmp2, tmp3,
-        zero_const, one_const, two_const
+        zero_const, one_const, two_const,
+        v_idx, v_val, v_node_val, v_tmp1, v_tmp2, v_const_a, v_const_b,
+        tmp_addr, base_addr
     ):
-        """Emit one vectorized iteration processing VLEN elements"""
-        # Get vector scratch addresses
-        v_idx = self.scratch["v_idx"]
-        v_val = self.scratch["v_val"]
-        v_node_val = self.scratch["v_node_val"]
-        v_addr = self.scratch["v_addr"]
-        v_tmp1 = self.scratch["v_tmp1"]
-        v_tmp2 = self.scratch["v_tmp2"]
+        """Emit one vectorized iteration processing VLEN elements.
+        Uses pre-allocated scratch to avoid running out of space.
+        Batches operations to maximize instruction-level parallelism."""
 
-        base_addr = self.alloc_scratch()
-
-        # Load base address for this batch chunk
+        # Phase 1: Load indices and values (can be parallel)
         self.emit("load", ("const", base_addr, batch_idx))
+        self.emit("load", ("const", tmp_addr, batch_idx))
         self.emit("alu", ("+", base_addr, self.scratch["inp_indices_p"], base_addr))
-        self.flush_schedule()
+        self.emit("alu", ("+", tmp_addr, self.scratch["inp_values_p"], tmp_addr))
+        self.flush_schedule()  # Need addresses computed before loads
 
-        # vload indices
         self.emit("load", ("vload", v_idx, base_addr))
-        self.flush_schedule()
+        self.emit("load", ("vload", v_val, tmp_addr))
+        self.flush_schedule()  # Need idx loaded before computing node addresses
 
-        # Load values
-        self.emit("load", ("const", base_addr, batch_idx))
-        self.emit("alu", ("+", base_addr, self.scratch["inp_values_p"], base_addr))
-        self.flush_schedule()
-        self.emit("load", ("vload", v_val, base_addr))
-        self.flush_schedule()
-
-        # For node_val, we need gather (not directly supported, so fall back to scalar loads)
-        # This is a limitation - true vectorization needs gather support
-        # For now, emit scalar loads for node values
-        tmp_addr = self.alloc_scratch()
-        for vi in range(VLEN):
+        # Phase 2: Gather node_val - use both load slots by computing 2 addresses at once
+        # We need a second temp address register
+        tmp_addr2 = base_addr  # Reuse base_addr for second address computation
+        for vi in range(0, VLEN, 2):
+            # Compute 2 addresses in parallel
             self.emit("alu", ("+", tmp_addr, self.scratch["forest_values_p"], v_idx + vi))
+            self.emit("alu", ("+", tmp_addr2, self.scratch["forest_values_p"], v_idx + vi + 1))
             self.flush_schedule()
+            # Load 2 values using both load slots
             self.emit("load", ("load", v_node_val + vi, tmp_addr))
-            self.flush_schedule()
+            self.emit("load", ("load", v_node_val + vi + 1, tmp_addr2))
+        self.flush_schedule()
 
-        # val = val ^ node_val (vectorized)
+        # Phase 3: XOR and hash (mostly independent VALU ops)
         self.emit("valu", ("^", v_val, v_val, v_node_val))
+
+        # Vectorized hash - inline for better packing
+        for op1, val1, op2, op3, val3 in HASH_STAGES:
+            self.emit("valu", ("vbroadcast", v_const_a, self.get_const(val1)))
+            self.emit("valu", ("vbroadcast", v_const_b, self.get_const(val3)))
+            self.emit("valu", (op1, v_tmp1, v_val, v_const_a))
+            self.emit("valu", (op3, v_tmp2, v_val, v_const_b))
+            self.flush_schedule()  # Need tmp1, tmp2 before combining
+            self.emit("valu", (op2, v_val, v_tmp1, v_tmp2))
         self.flush_schedule()
 
-        # Vectorized hash
-        self._emit_vector_hash(v_val, v_tmp1, v_tmp2)
-
-        # Compute next indices (vectorized)
+        # Phase 4: Compute next indices
         self.emit("valu", ("vbroadcast", v_tmp1, two_const))
+        self.emit("valu", ("vbroadcast", v_const_a, zero_const))
         self.flush_schedule()
+
         self.emit("valu", ("%", v_tmp2, v_val, v_tmp1))  # val % 2
-        self.emit("valu", ("vbroadcast", v_tmp1, zero_const))
-        self.flush_schedule()
-        self.emit("valu", ("==", v_tmp2, v_tmp2, v_tmp1))  # == 0
-        self.emit("valu", ("vbroadcast", v_tmp1, one_const))
+        self.emit("valu", ("*", v_idx, v_idx, v_tmp1))   # 2*idx (can run in parallel!)
         self.flush_schedule()
 
-        # Can't easily do vselect with scalars, need broadcasts
-        v_one = self.alloc_vector_scratch()
-        v_two = self.alloc_vector_scratch()
-        self.emit("valu", ("vbroadcast", v_one, one_const))
-        self.emit("valu", ("vbroadcast", v_two, two_const))
+        self.emit("valu", ("==", v_tmp2, v_tmp2, v_const_a))  # == 0
+        self.emit("valu", ("vbroadcast", v_const_a, one_const))
+        self.emit("valu", ("vbroadcast", v_const_b, two_const))
         self.flush_schedule()
 
-        self.emit("flow", ("vselect", v_tmp1, v_tmp2, v_one, v_two))  # 1 or 2
-        self.emit("valu", ("*", v_idx, v_idx, v_two))  # 2*idx
-        self.flush_schedule()
-        self.emit("valu", ("+", v_idx, v_idx, v_tmp1))  # + offset
+        self.emit("flow", ("vselect", v_tmp1, v_tmp2, v_const_a, v_const_b))  # 1 or 2
         self.flush_schedule()
 
-        # Wrap check (vectorized)
+        self.emit("valu", ("+", v_idx, v_idx, v_tmp1))  # 2*idx + offset
         self.emit("valu", ("vbroadcast", v_tmp1, self.scratch["n_nodes"]))
         self.flush_schedule()
+
+        # Phase 5: Wrap check
         self.emit("valu", ("<", v_tmp2, v_idx, v_tmp1))
         self.emit("valu", ("vbroadcast", v_tmp1, zero_const))
         self.flush_schedule()
+
         self.emit("flow", ("vselect", v_idx, v_tmp2, v_idx, v_tmp1))
         self.flush_schedule()
 
-        # Store results
+        # Phase 6: Store results (use both store slots in parallel)
         self.emit("load", ("const", base_addr, batch_idx))
+        self.emit("load", ("const", tmp_addr, batch_idx))
         self.emit("alu", ("+", base_addr, self.scratch["inp_indices_p"], base_addr))
+        self.emit("alu", ("+", tmp_addr, self.scratch["inp_values_p"], tmp_addr))
         self.flush_schedule()
-        self.emit("store", ("vstore", base_addr, v_idx))
 
-        self.emit("load", ("const", base_addr, batch_idx))
-        self.emit("alu", ("+", base_addr, self.scratch["inp_values_p"], base_addr))
-        self.flush_schedule()
-        self.emit("store", ("vstore", base_addr, v_val))
+        # Both vstores can happen in same cycle since we have 2 store slots
+        self.emit("store", ("vstore", base_addr, v_idx))
+        self.emit("store", ("vstore", tmp_addr, v_val))
         self.flush_schedule()
 
     def _emit_hash(self, val_addr: int, tmp1: int, tmp2: int, fuse: bool = False):
@@ -829,18 +844,15 @@ class ParameterizedKernelBuilder:
             self.emit("alu", (op2, val_addr, tmp1, tmp2))
             self.flush_schedule()
 
-    def _emit_vector_hash(self, v_val: int, v_tmp1: int, v_tmp2: int):
-        """Emit vectorized hash computation"""
+    def _emit_vector_hash(self, v_val: int, v_tmp1: int, v_tmp2: int, v_const_a: int, v_const_b: int):
+        """Emit vectorized hash computation using pre-allocated vector scratch"""
         for op1, val1, op2, op3, val3 in HASH_STAGES:
-            # Need to broadcast constants to vectors
-            v_const1 = self.alloc_vector_scratch()
-            v_const3 = self.alloc_vector_scratch()
-            self.emit("valu", ("vbroadcast", v_const1, self.get_const(val1)))
-            self.emit("valu", ("vbroadcast", v_const3, self.get_const(val3)))
-            self.flush_schedule()
+            # Broadcast constants to reusable vector scratch
+            self.emit("valu", ("vbroadcast", v_const_a, self.get_const(val1)))
+            self.emit("valu", ("vbroadcast", v_const_b, self.get_const(val3)))
 
-            self.emit("valu", (op1, v_tmp1, v_val, v_const1))
-            self.emit("valu", (op3, v_tmp2, v_val, v_const3))
+            self.emit("valu", (op1, v_tmp1, v_val, v_const_a))
+            self.emit("valu", (op3, v_tmp2, v_val, v_const_b))
             self.flush_schedule()
             self.emit("valu", (op2, v_val, v_tmp1, v_tmp2))
             self.flush_schedule()

@@ -1,0 +1,106 @@
+{
+  "best_fitness": 15896.0,
+  "best_genome": {
+    "batch_unroll_factor": 1,
+    "round_unroll_factor": 1,
+    "loop_order": "round_batch",
+    "vectorize_batch": true,
+    "vectorize_hash": true,
+    "pipeline_depth": 1,
+    "schedule_strategy": "greedy",
+    "max_bundle_fill": 1.0,
+    "load_ahead_distance": 0,
+    "scratch_allocation": "compact",
+    "preload_constants": true,
+    "use_add_imm": false,
+    "fuse_hash_stages": true
+  },
+  "history": [
+    {
+      "generation": 0,
+      "best_fitness": 15896.0,
+      "gen_best": 15896.0,
+      "gen_avg": 39639.5,
+      "valid_count": 4,
+      "time": 0.9411380290985107
+    },
+    {
+      "generation": 1,
+      "best_fitness": 15896.0,
+      "gen_best": 15896.0,
+      "gen_avg": 15897.4,
+      "valid_count": 5,
+      "time": 1.232050895690918
+    },
+    {
+      "generation": 2,
+      "best_fitness": 15896.0,
+      "gen_best": 15896.0,
+      "gen_avg": 15897.75,
+      "valid_count": 12,
+      "time": 1.1107752323150635
+    },
+    {
+      "generation": 3,
+      "best_fitness": 15896.0,
+      "gen_best": 15896.0,
+      "gen_avg": 15897.3125,
+      "valid_count": 16,
+      "time": 0.9936370849609375
+    },
+    {
+      "generation": 4,
+      "best_fitness": 15896.0,
+      "gen_best": 15896.0,
+      "gen_avg": 15897.555555555555,
+      "valid_count": 18,
+      "time": 1.0147781372070312
+    },
+    {
+      "generation": 5,
+      "best_fitness": 15896.0,
+      "gen_best": 15896.0,
+      "gen_avg": 15897.166666666666,
+      "valid_count": 18,
+      "time": 0.8236758708953857
+    },
+    {
+      "generation": 6,
+      "best_fitness": 15896.0,
+      "gen_best": 15896.0,
+      "gen_avg": 15897.64705882353,
+      "valid_count": 17,
+      "time": 0.8687717914581299
+    },
+    {
+      "generation": 7,
+      "best_fitness": 15896.0,
+      "gen_best": 15896.0,
+      "gen_avg": 15897.235294117647,
+      "valid_count": 17,
+      "time": 1.142934799194336
+    },
+    {
+      "generation": 8,
+      "best_fitness": 15896.0,
+      "gen_best": 15896.0,
+      "gen_avg": 15897.166666666666,
+      "valid_count": 18,
+      "time": 1.1201951503753662
+    },
+    {
+      "generation": 9,
+      "best_fitness": 15896.0,
+      "gen_best": 15896.0,
+      "gen_avg": 15897.555555555555,
+      "valid_count": 18,
+      "time": 0.9526882171630859
+    }
+  ],
+  "config": {
+    "population_size": 20,
+    "generations": 10,
+    "mutation_rate": 0.15,
+    "crossover_rate": 0.8
+  }
+}
