@@ -1,21 +1,15 @@
 """
-Genetic Programming optimizer for VLIW kernel synthesis.
+Enhanced Genetic Programming optimizer for VLIW kernel synthesis.
 
-Instead of parameterizing a fixed template, this evolves the PROGRAM STRUCTURE
-itself using tree-based GP with a grammar that captures VLIW constraints.
-
-Key insight: The problem is program synthesis, not parameter tuning.
-The genome should BE the program, not parameters TO a program generator.
-
-The grammar ensures all generated programs are valid by construction:
-- Type system prevents invalid compositions
-- Grammar productions respect VLIW slot limits
-- Crossover exchanges semantically meaningful subtrees
+V2 improvements:
+- Richer node parameters (unrolling, scheduling hints, more flush control)
+- Deeper tree structure (nested loops, phase reordering)
+- Diversity mechanisms (random immigrants, fitness sharing)
 """
 
 from __future__ import annotations
-from dataclasses import dataclass, field
-from typing import List, Tuple, Optional, Union, Dict, Any, Callable
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
 from enum import Enum, auto
 from abc import ABC, abstractmethod
 from copy import deepcopy
@@ -40,66 +34,54 @@ from problem import (
 
 
 # =============================================================================
-# Type System for GP
+# Type System
 # =============================================================================
 
 class GPType(Enum):
-    """Types in our GP system - ensures valid compositions"""
-    PROGRAM = auto()      # Complete program
-    SETUP = auto()        # Setup/initialization phase
-    LOOP = auto()         # Loop structure
-    PHASE_SEQ = auto()    # Sequence of phases
-    GATHER = auto()       # Gather phase (loads)
-    HASH = auto()         # Hash computation phase
-    INDEX = auto()        # Index computation phase
-    STORE = auto()        # Store phase
-    VALU_OP = auto()      # Vector ALU operation
-    ALU_OP = auto()       # Scalar ALU operation
-    ADDR_COMP = auto()    # Address computation
-    FLUSH_POINT = auto()  # Synchronization point
+    PROGRAM = auto()
+    SETUP = auto()
+    LOOP = auto()
+    PHASE_SEQ = auto()
+    PHASE_GROUP = auto()  # New: group of phases that can be reordered
+    GATHER = auto()
+    HASH = auto()
+    INDEX = auto()
+    STORE = auto()
+    TRANSFORM = auto()  # New: wrapper for transformations
 
 
 # =============================================================================
-# AST Node Base Classes
+# Base Node
 # =============================================================================
 
 class GPNode(ABC):
-    """Base class for all GP tree nodes"""
-
     @property
     @abstractmethod
     def node_type(self) -> GPType:
-        """Return the type of this node"""
         pass
 
     @abstractmethod
     def children(self) -> List['GPNode']:
-        """Return list of child nodes"""
         pass
 
     @abstractmethod
     def replace_child(self, index: int, new_child: 'GPNode') -> None:
-        """Replace child at index"""
         pass
 
     @abstractmethod
     def clone(self) -> 'GPNode':
-        """Deep copy this node and all descendants"""
         pass
 
     def size(self) -> int:
-        """Count nodes in subtree"""
         return 1 + sum(c.size() for c in self.children())
 
     def depth(self) -> int:
-        """Max depth of subtree"""
         children = self.children()
         if not children:
             return 1
         return 1 + max(c.depth() for c in children)
 
     def all_nodes(self) -> List[Tuple['GPNode', Optional['GPNode'], int]]:
-        """Return all nodes with parent info: (node, parent, child_index)"""
         result: List[Tuple['GPNode', Optional['GPNode'], int]] = [(self, None, -1)]
         for i, child in enumerate(self.children()):
             result.append((child, self, i))
@@ -116,7 +98,7 @@ class GPNode(ABC):
 
 @dataclass
 class ProgramNode(GPNode):
-    """Root node: complete program"""
+    """Root node"""
     setup: 'SetupNode'
     main_loop: 'LoopNode'
 
@@ -134,19 +116,20 @@ class ProgramNode(GPNode):
             self.main_loop = new_child
 
     def clone(self) -> 'ProgramNode':
-        return ProgramNode(
-            setup=self.setup.clone(),
-            main_loop=self.main_loop.clone()
-        )
+        return ProgramNode(self.setup.clone(), self.main_loop.clone())
 
 
 @dataclass
 class SetupNode(GPNode):
-    """Setup phase: constant preloading"""
+    """Setup phase with more options"""
     preload_scalars: bool = True
     preload_vectors: bool = True
     preload_hash_consts: bool = True
     preload_n_nodes: bool = False
+    # New: memory alignment
+    align_vectors: bool = True
+    # New: scratch organization
+    separate_temps: bool = False
 
     @property
     def node_type(self) -> GPType:
@@ -160,54 +143,85 @@ class SetupNode(GPNode):
 
     def clone(self) -> 'SetupNode':
         return SetupNode(
-            preload_scalars=self.preload_scalars,
-            preload_vectors=self.preload_vectors,
-            preload_hash_consts=self.preload_hash_consts,
-            preload_n_nodes=self.preload_n_nodes
+            self.preload_scalars, self.preload_vectors,
+            self.preload_hash_consts, self.preload_n_nodes,
+            self.align_vectors, self.separate_temps
         )
 
 
 class LoopStructure(Enum):
-    """How to structure the iteration"""
-    ROUND_BATCH = "round_batch"    # for round: for batch_chunk
-    BATCH_ROUND = "batch_round"    # for batch_chunk: for round
-    FUSED = "fused"                # Single fused loop
-    CHUNKED = "chunked"            # Process chunks in parallel
+    ROUND_BATCH = "round_batch"
+    BATCH_ROUND = "batch_round"
+    FUSED = "fused"
+    CHUNKED = "chunked"
+    TILED = "tiled"  # New: 2D tiling
 
 
 @dataclass
 class LoopNode(GPNode):
-    """Loop structure node"""
+    """Loop structure with unrolling and nesting"""
     structure: LoopStructure
-    parallel_chunks: int  # How many vector chunks to process together
-    body: 'PhaseSequenceNode'
+    parallel_chunks: int
+    # New: unrolling factors
+    batch_unroll: int = 1
+    round_unroll: int = 1
+    # New: optional nested loop
+    inner_loop: Optional['LoopNode'] = None
+    # Body
+    body: 'PhaseSequenceNode' = None
+
+    def __post_init__(self):
+        if self.body is None:
+            self.body = random_phase_sequence()
 
     @property
     def node_type(self) -> GPType:
         return GPType.LOOP
 
     def children(self) -> List[GPNode]:
-        return [self.body]
+        kids = [self.body]
+        if self.inner_loop is not None:
+            kids.append(self.inner_loop)
+        return kids
 
     def replace_child(self, index: int, new_child: GPNode):
         if index == 0 and isinstance(new_child, PhaseSequenceNode):
             self.body = new_child
+        elif index == 1 and isinstance(new_child, LoopNode):
+            self.inner_loop = new_child
 
     def clone(self) -> 'LoopNode':
         return LoopNode(
             structure=self.structure,
             parallel_chunks=self.parallel_chunks,
+            batch_unroll=self.batch_unroll,
+            round_unroll=self.round_unroll,
+            inner_loop=self.inner_loop.clone() if self.inner_loop else None,
             body=self.body.clone()
         )
 
 
+class PhaseOrder(Enum):
+    """Order of phases within a sequence"""
+    STANDARD = "standard"          # gather -> hash -> index -> store
+    HASH_FIRST = "hash_first"      # hash -> gather -> index -> store (speculative)
+    INTERLEAVED = "interleaved"    # interleave operations
+    PIPELINED = "pipelined"        # overlap phases
+
+
 @dataclass
 class PhaseSequenceNode(GPNode):
-    """Sequence of computational phases"""
+    """Sequence of phases with ordering options"""
     gather: 'GatherNode'
     hash_comp: 'HashNode'
     index_comp: 'IndexNode'
     store: 'StoreNode'
+    # New: phase ordering
+    order: PhaseOrder = PhaseOrder.STANDARD
+    # New: inter-phase flush control
+    flush_after_gather: bool = True
+    flush_after_hash: bool = True
+    flush_after_index: bool = True
 
     @property
     def node_type(self) -> GPType:
@@ -231,28 +245,40 @@ class PhaseSequenceNode(GPNode):
             gather=self.gather.clone(),
             hash_comp=self.hash_comp.clone(),
             index_comp=self.index_comp.clone(),
-            store=self.store.clone()
+            store=self.store.clone(),
+            order=self.order,
+            flush_after_gather=self.flush_after_gather,
+            flush_after_hash=self.flush_after_hash,
+            flush_after_index=self.flush_after_index
         )
 
 
 # =============================================================================
-# Phase Implementation Nodes
+# Phase Nodes (Enhanced)
 # =============================================================================
 
 class GatherStrategy(Enum):
-    """Different gather implementations"""
-    SEQUENTIAL = "sequential"      # One load at a time
-    DUAL_ADDR = "dual_addr"        # Two addresses, two loads
-    BATCH_ADDR = "batch_addr"      # All addresses, then all loads
-    PIPELINED = "pipelined"        # Overlap address calc with loads
+    SEQUENTIAL = "sequential"
+    DUAL_ADDR = "dual_addr"
+    BATCH_ADDR = "batch_addr"
+    PIPELINED = "pipelined"
+    VECTORIZED = "vectorized"  # New
 
 
 @dataclass
 class GatherNode(GPNode):
-    """Gather phase: load values from computed addresses"""
+    """Gather phase with more parameters"""
     strategy: GatherStrategy
+    # Flush control
     flush_after_addr: bool = True
     flush_per_element: bool = False
+    flush_per_chunk: bool = False
+    # New: unrolling
+    unroll_factor: int = 1
+    # New: prefetch distance
+    prefetch_distance: int = 0
+    # New: address computation
+    use_add_imm: bool = False
 
     @property
     def node_type(self) -> GPType:
@@ -268,23 +294,36 @@ class GatherNode(GPNode):
         return GatherNode(
             strategy=self.strategy,
             flush_after_addr=self.flush_after_addr,
-            flush_per_element=self.flush_per_element
+            flush_per_element=self.flush_per_element,
+            flush_per_chunk=self.flush_per_chunk,
+            unroll_factor=self.unroll_factor,
+            prefetch_distance=self.prefetch_distance,
+            use_add_imm=self.use_add_imm
         )
 
 
 class HashStrategy(Enum):
-    """Different hash implementations"""
-    STANDARD = "standard"          # Flush after each stage
-    FUSED = "fused"                # Single flush at end
-    INTERLEAVED = "interleaved"    # Interleave across chunks
+    STANDARD = "standard"
+    FUSED = "fused"
+    INTERLEAVED = "interleaved"
+    UNROLLED = "unrolled"  # New
+    PIPELINED = "pipelined"  # New
 
 
 @dataclass
 class HashNode(GPNode):
-    """Hash computation phase"""
+    """Hash computation with more parameters"""
     strategy: HashStrategy
+    # Flush control
     flush_per_stage: bool = True
+    flush_after_xor: bool = True
+    # Constants
     use_preloaded_consts: bool = True
+    inline_consts: bool = False
+    # New: unrolling
+    unroll_stages: int = 1  # 1, 2, 3, or 6
+    # New: operation fusion
+    fuse_xor_with_stage1: bool = False
 
     @property
     def node_type(self) -> GPType:
@@ -300,23 +339,36 @@ class HashNode(GPNode):
         return HashNode(
             strategy=self.strategy,
             flush_per_stage=self.flush_per_stage,
-            use_preloaded_consts=self.use_preloaded_consts
+            flush_after_xor=self.flush_after_xor,
+            use_preloaded_consts=self.use_preloaded_consts,
+            inline_consts=self.inline_consts,
+            unroll_stages=self.unroll_stages,
+            fuse_xor_with_stage1=self.fuse_xor_with_stage1
         )
 
 
 class IndexStrategy(Enum):
-    """Different index computation approaches"""
-    VSELECT = "vselect"            # Use flow vselect
-    ARITHMETIC = "arithmetic"       # Pure arithmetic: offset = 2 - cond
-    MULTIPLY_ADD = "multiply_add"   # Use multiply_add instruction
+    VSELECT = "vselect"
+    ARITHMETIC = "arithmetic"
+    MULTIPLY_ADD = "multiply_add"
+    BITWISE = "bitwise"  # New
+    BRANCHLESS = "branchless"  # New
 
 
 @dataclass
 class IndexNode(GPNode):
-    """Index computation phase"""
+    """Index computation with more parameters"""
     strategy: IndexStrategy
+    # Flush control
     flush_per_op: bool = True
+    flush_after_mod: bool = True
+    flush_after_mul: bool = True
+    # Constants
     use_preloaded_consts: bool = True
+    # New: bounds check
+    speculative_bounds: bool = False  # Check bounds before/after
+    # New: index computation fusion
+    fuse_mul_add: bool = False
 
     @property
     def node_type(self) -> GPType:
@@ -332,14 +384,26 @@ class IndexNode(GPNode):
         return IndexNode(
             strategy=self.strategy,
             flush_per_op=self.flush_per_op,
-            use_preloaded_consts=self.use_preloaded_consts
+            flush_after_mod=self.flush_after_mod,
+            flush_after_mul=self.flush_after_mul,
+            use_preloaded_consts=self.use_preloaded_consts,
+            speculative_bounds=self.speculative_bounds,
+            fuse_mul_add=self.fuse_mul_add
         )
 
 
 @dataclass
 class StoreNode(GPNode):
-    """Store phase"""
+    """Store phase with more parameters"""
+    # Flush control
     flush_after_addr: bool = True
+    flush_per_store: bool = False
+    # New: store ordering
+    store_indices_first: bool = True
+    # New: address computation
+    use_add_imm: bool = False
+    # New: coalescing
+    coalesce_stores: bool = False
 
     @property
     def node_type(self) -> GPType:
@@ -352,48 +416,78 @@ class StoreNode(GPNode):
         pass
 
     def clone(self) -> 'StoreNode':
-        return StoreNode(flush_after_addr=self.flush_after_addr)
+        return StoreNode(
+            flush_after_addr=self.flush_after_addr,
+            flush_per_store=self.flush_per_store,
+            store_indices_first=self.store_indices_first,
+            use_add_imm=self.use_add_imm,
+            coalesce_stores=self.coalesce_stores
+        )
 
 
 # =============================================================================
-# Tree Generation (Grow/Full methods)
+# Tree Generation
 # =============================================================================
+
+def random_bool() -> bool:
+    return random.choice([True, False])
+
 
 def random_setup() -> SetupNode:
     return SetupNode(
-        preload_scalars=random.choice([True, False]),
-        preload_vectors=random.choice([True, False]),
-        preload_hash_consts=random.choice([True, False]),
-        preload_n_nodes=random.choice([True, False])
+        preload_scalars=random_bool(),
+        preload_vectors=random_bool(),
+        preload_hash_consts=random_bool(),
+        preload_n_nodes=random_bool(),
+        align_vectors=random_bool(),
+        separate_temps=random_bool()
     )
 
 
 def random_gather() -> GatherNode:
     return GatherNode(
         strategy=random.choice(list(GatherStrategy)),
-        flush_after_addr=random.choice([True, False]),
-        flush_per_element=random.choice([True, False])
+        flush_after_addr=random_bool(),
+        flush_per_element=random_bool(),
+        flush_per_chunk=random_bool(),
+        unroll_factor=random.choice([1, 2, 4]),
+        prefetch_distance=random.choice([0, 1, 2]),
+        use_add_imm=random_bool()
     )
 
 
 def random_hash() -> HashNode:
     return HashNode(
         strategy=random.choice(list(HashStrategy)),
-        flush_per_stage=random.choice([True, False]),
-        use_preloaded_consts=random.choice([True, False])
+        flush_per_stage=random_bool(),
+        flush_after_xor=random_bool(),
+        use_preloaded_consts=random_bool(),
+        inline_consts=random_bool(),
+        unroll_stages=random.choice([1, 2, 3, 6]),
+        fuse_xor_with_stage1=random_bool()
     )
 
 
 def random_index() -> IndexNode:
     return IndexNode(
         strategy=random.choice(list(IndexStrategy)),
-        flush_per_op=random.choice([True, False]),
-        use_preloaded_consts=random.choice([True, False])
+        flush_per_op=random_bool(),
+        flush_after_mod=random_bool(),
+        flush_after_mul=random_bool(),
+        use_preloaded_consts=random_bool(),
+        speculative_bounds=random_bool(),
+        fuse_mul_add=random_bool()
     )
 
 
 def random_store() -> StoreNode:
-    return StoreNode(flush_after_addr=random.choice([True, False]))
+    return StoreNode(
+        flush_after_addr=random_bool(),
+        flush_per_store=random_bool(),
+        store_indices_first=random_bool(),
+        use_add_imm=random_bool(),
+        coalesce_stores=random_bool()
+    )
 
 
 def random_phase_sequence() -> PhaseSequenceNode:
@@ -401,92 +495,117 @@ def random_phase_sequence() -> PhaseSequenceNode:
         gather=random_gather(),
         hash_comp=random_hash(),
         index_comp=random_index(),
-        store=random_store()
+        store=random_store(),
+        order=random.choice(list(PhaseOrder)),
+        flush_after_gather=random_bool(),
+        flush_after_hash=random_bool(),
+        flush_after_index=random_bool()
     )
 
 
-def random_loop() -> LoopNode:
+def random_loop(max_depth: int = 3, current_depth: int = 0) -> LoopNode:
+    """Generate random loop, possibly with nested inner loop"""
+    has_inner = current_depth < max_depth - 1 and random.random() < 0.3
+
     return LoopNode(
         structure=random.choice(list(LoopStructure)),
-        # Avoid chunks < 4 as they generate too many instructions and simulate slowly
         parallel_chunks=random.choice([4, 8, 16]),
+        batch_unroll=random.choice([1, 2, 4]),
+        round_unroll=random.choice([1, 2, 4, 8]),
+        inner_loop=random_loop(max_depth, current_depth + 1) if has_inner else None,
         body=random_phase_sequence()
     )
 
 
-def random_program() -> ProgramNode:
-    """Generate a random program tree"""
+def random_program(max_depth: int = 4) -> ProgramNode:
     return ProgramNode(
         setup=random_setup(),
-        main_loop=random_loop()
+        main_loop=random_loop(max_depth)
     )
 
 
 def seeded_program(seed_type: str) -> ProgramNode:
-    """Generate a program seeded toward a particular strategy"""
-
+    """Generate seeded programs for diversity"""
     if seed_type == "minimal_flush":
         return ProgramNode(
-            setup=SetupNode(True, True, True, True),
+            setup=SetupNode(True, True, True, True, True, False),
             main_loop=LoopNode(
                 structure=LoopStructure.CHUNKED,
-                parallel_chunks=8,
+                parallel_chunks=16,
+                batch_unroll=1,
+                round_unroll=1,
                 body=PhaseSequenceNode(
-                    gather=GatherNode(GatherStrategy.BATCH_ADDR, False, False),
-                    hash_comp=HashNode(HashStrategy.FUSED, False, True),
-                    index_comp=IndexNode(IndexStrategy.ARITHMETIC, False, True),
-                    store=StoreNode(False)
+                    gather=GatherNode(GatherStrategy.BATCH_ADDR, False, False, False, 1, 0, False),
+                    hash_comp=HashNode(HashStrategy.FUSED, False, False, True, False, 1, False),
+                    index_comp=IndexNode(IndexStrategy.ARITHMETIC, False, False, False, True, False, False),
+                    store=StoreNode(False, False, True, False, False),
+                    order=PhaseOrder.STANDARD,
+                    flush_after_gather=False,
+                    flush_after_hash=False,
+                    flush_after_index=False
                 )
             )
         )
 
     elif seed_type == "max_parallel":
         return ProgramNode(
-            setup=SetupNode(True, True, True, True),
+            setup=SetupNode(True, True, True, True, True, False),
             main_loop=LoopNode(
                 structure=LoopStructure.CHUNKED,
                 parallel_chunks=16,
+                batch_unroll=4,
+                round_unroll=4,
                 body=PhaseSequenceNode(
-                    gather=GatherNode(GatherStrategy.PIPELINED, True, False),
-                    hash_comp=HashNode(HashStrategy.INTERLEAVED, False, True),
-                    index_comp=IndexNode(IndexStrategy.MULTIPLY_ADD, False, True),
-                    store=StoreNode(True)
+                    gather=GatherNode(GatherStrategy.PIPELINED, True, False, False, 2, 1, False),
+                    hash_comp=HashNode(HashStrategy.INTERLEAVED, False, False, True, False, 2, True),
+                    index_comp=IndexNode(IndexStrategy.MULTIPLY_ADD, False, False, False, True, False, True),
+                    store=StoreNode(True, False, True, False, True),
+                    order=PhaseOrder.PIPELINED,
+                    flush_after_gather=True,
+                    flush_after_hash=False,
+                    flush_after_index=False
                 )
             )
         )
 
-    elif seed_type == "conservative":
+    elif seed_type == "deep_nested":
+        inner = LoopNode(
+            structure=LoopStructure.FUSED,
+            parallel_chunks=8,
+            batch_unroll=2,
+            round_unroll=2,
+            body=random_phase_sequence()
+        )
         return ProgramNode(
-            setup=SetupNode(True, True, True, False),
+            setup=SetupNode(True, True, True, True, True, True),
             main_loop=LoopNode(
-                structure=LoopStructure.ROUND_BATCH,
+                structure=LoopStructure.TILED,
                 parallel_chunks=4,
-                body=PhaseSequenceNode(
-                    gather=GatherNode(GatherStrategy.DUAL_ADDR, True, False),
-                    hash_comp=HashNode(HashStrategy.STANDARD, True, True),
-                    index_comp=IndexNode(IndexStrategy.VSELECT, True, True),
-                    store=StoreNode(True)
-                )
+                batch_unroll=1,
+                round_unroll=1,
+                inner_loop=inner,
+                body=random_phase_sequence()
             )
         )
 
     else:  # baseline
         return ProgramNode(
-            setup=SetupNode(True, True, True, False),
+            setup=SetupNode(True, True, True, False, True, False),
             main_loop=LoopNode(
                 structure=LoopStructure.CHUNKED,
                 parallel_chunks=8,
+                batch_unroll=1,
+                round_unroll=1,
                 body=random_phase_sequence()
             )
         )
 
 
 # =============================================================================
-# GP Operators: Crossover and Mutation
+# GP Operators
 # =============================================================================
 
 def get_nodes_of_type(tree: GPNode, target_type: GPType) -> List[Tuple[GPNode, GPNode, int]]:
-    """Find all nodes of a given type with their parent info"""
     result = []
     for node, parent, idx in tree.all_nodes():
         if node.node_type == target_type:
@@ -495,24 +614,17 @@ def get_nodes_of_type(tree: GPNode, target_type: GPType) -> List[Tuple[GPNode, G
 
 
 def subtree_crossover(parent1: ProgramNode, parent2: ProgramNode) -> ProgramNode:
-    """
-    Subtree crossover: swap type-compatible subtrees between parents.
-    This is the key GP operator - it preserves semantic validity because
-    we only swap subtrees of the same type.
-    """
+    """Type-safe subtree crossover"""
     child = parent1.clone()
 
-    # Pick a random type to exchange
     exchangeable_types = [GPType.SETUP, GPType.LOOP, GPType.PHASE_SEQ,
                          GPType.GATHER, GPType.HASH, GPType.INDEX, GPType.STORE]
     target_type = random.choice(exchangeable_types)
 
-    # Find nodes of that type in both parents
     child_nodes = get_nodes_of_type(child, target_type)
     parent2_nodes = get_nodes_of_type(parent2, target_type)
 
     if child_nodes and parent2_nodes:
-        # Pick random nodes to swap
         _, child_parent, child_idx = random.choice(child_nodes)
         donor_node, _, _ = random.choice(parent2_nodes)
 
@@ -522,11 +634,8 @@ def subtree_crossover(parent1: ProgramNode, parent2: ProgramNode) -> ProgramNode
     return child
 
 
-def point_mutation(tree: ProgramNode, rate: float = 0.3) -> ProgramNode:
-    """
-    Point mutation: mutate individual node parameters.
-    Unlike subtree mutation, this makes small local changes.
-    """
+def point_mutation(tree: ProgramNode, rate: float = 0.2) -> ProgramNode:
+    """Mutate individual parameters"""
     tree = tree.clone()
 
     for node, parent, idx in tree.all_nodes():
@@ -535,62 +644,110 @@ def point_mutation(tree: ProgramNode, rate: float = 0.3) -> ProgramNode:
 
         if isinstance(node, SetupNode):
             field = random.choice(['preload_scalars', 'preload_vectors',
-                                   'preload_hash_consts', 'preload_n_nodes'])
+                                   'preload_hash_consts', 'preload_n_nodes',
+                                   'align_vectors', 'separate_temps'])
             setattr(node, field, not getattr(node, field))
 
         elif isinstance(node, LoopNode):
-            if random.random() < 0.5:
+            choice = random.randint(0, 3)
+            if choice == 0:
                 node.structure = random.choice(list(LoopStructure))
-            else:
+            elif choice == 1:
                 node.parallel_chunks = random.choice([4, 8, 16])
+            elif choice == 2:
+                node.batch_unroll = random.choice([1, 2, 4])
+            else:
+                node.round_unroll = random.choice([1, 2, 4, 8])
+
+        elif isinstance(node, PhaseSequenceNode):
+            choice = random.randint(0, 3)
+            if choice == 0:
+                node.order = random.choice(list(PhaseOrder))
+            elif choice == 1:
+                node.flush_after_gather = not node.flush_after_gather
+            elif choice == 2:
+                node.flush_after_hash = not node.flush_after_hash
+            else:
+                node.flush_after_index = not node.flush_after_index
 
         elif isinstance(node, GatherNode):
-            choice = random.randint(0, 2)
+            choice = random.randint(0, 6)
             if choice == 0:
                 node.strategy = random.choice(list(GatherStrategy))
             elif choice == 1:
                 node.flush_after_addr = not node.flush_after_addr
-            else:
+            elif choice == 2:
                 node.flush_per_element = not node.flush_per_element
+            elif choice == 3:
+                node.flush_per_chunk = not node.flush_per_chunk
+            elif choice == 4:
+                node.unroll_factor = random.choice([1, 2, 4])
+            elif choice == 5:
+                node.prefetch_distance = random.choice([0, 1, 2])
+            else:
+                node.use_add_imm = not node.use_add_imm
 
         elif isinstance(node, HashNode):
-            choice = random.randint(0, 2)
+            choice = random.randint(0, 6)
             if choice == 0:
                 node.strategy = random.choice(list(HashStrategy))
             elif choice == 1:
                 node.flush_per_stage = not node.flush_per_stage
-            else:
+            elif choice == 2:
+                node.flush_after_xor = not node.flush_after_xor
+            elif choice == 3:
                 node.use_preloaded_consts = not node.use_preloaded_consts
+            elif choice == 4:
+                node.inline_consts = not node.inline_consts
+            elif choice == 5:
+                node.unroll_stages = random.choice([1, 2, 3, 6])
+            else:
+                node.fuse_xor_with_stage1 = not node.fuse_xor_with_stage1
 
         elif isinstance(node, IndexNode):
-            choice = random.randint(0, 2)
+            choice = random.randint(0, 6)
             if choice == 0:
                 node.strategy = random.choice(list(IndexStrategy))
             elif choice == 1:
                 node.flush_per_op = not node.flush_per_op
-            else:
+            elif choice == 2:
+                node.flush_after_mod = not node.flush_after_mod
+            elif choice == 3:
+                node.flush_after_mul = not node.flush_after_mul
+            elif choice == 4:
                 node.use_preloaded_consts = not node.use_preloaded_consts
+            elif choice == 5:
+                node.speculative_bounds = not node.speculative_bounds
+            else:
+                node.fuse_mul_add = not node.fuse_mul_add
 
         elif isinstance(node, StoreNode):
-            node.flush_after_addr = not node.flush_after_addr
+            choice = random.randint(0, 4)
+            if choice == 0:
+                node.flush_after_addr = not node.flush_after_addr
+            elif choice == 1:
+                node.flush_per_store = not node.flush_per_store
+            elif choice == 2:
+                node.store_indices_first = not node.store_indices_first
+            elif choice == 3:
+                node.use_add_imm = not node.use_add_imm
+            else:
+                node.coalesce_stores = not node.coalesce_stores
 
     return tree
 
 
-def subtree_mutation(tree: ProgramNode) -> ProgramNode:
-    """
-    Subtree mutation: replace a random subtree with a new random one.
-    This provides large jumps in the search space.
-    """
+def subtree_mutation(tree: ProgramNode, max_depth: int = 4) -> ProgramNode:
+    """Replace a subtree with a new random one"""
     tree = tree.clone()
 
-    # Pick a random node type to replace
     replaceable = [
         (GPType.GATHER, random_gather),
         (GPType.HASH, random_hash),
         (GPType.INDEX, random_index),
         (GPType.STORE, random_store),
         (GPType.PHASE_SEQ, random_phase_sequence),
+        (GPType.LOOP, lambda: random_loop(max_depth)),
     ]
 
     target_type, generator = random.choice(replaceable)
@@ -604,12 +761,40 @@ def subtree_mutation(tree: ProgramNode) -> ProgramNode:
     return tree
 
 
+def add_nested_loop(tree: ProgramNode) -> ProgramNode:
+    """Add a nested loop to increase depth"""
+    tree = tree.clone()
+    loop_nodes = get_nodes_of_type(tree, GPType.LOOP)
+
+    for node, _, _ in loop_nodes:
+        if isinstance(node, LoopNode) and node.inner_loop is None:
+            if random.random() < 0.5:
+                node.inner_loop = random_loop(max_depth=2)
+                break
+
+    return tree
+
+
+def remove_nested_loop(tree: ProgramNode) -> ProgramNode:
+    """Remove a nested loop to decrease depth"""
+    tree = tree.clone()
+    loop_nodes = get_nodes_of_type(tree, GPType.LOOP)
+
+    for node, _, _ in loop_nodes:
+        if isinstance(node, LoopNode) and node.inner_loop is not None:
+            if random.random() < 0.5:
+                node.inner_loop = None
+                break
+
+    return tree
+
+
 # =============================================================================
-# Code Generator: AST -> VLIW Instructions
+# Code Generator (simplified - uses same structure as v1 but with new params)
 # =============================================================================
 
-class GPKernelBuilder:
-    """Compiles a GP tree into VLIW instructions"""
+class GPKernelBuilderV2:
+    """Compiles enhanced GP tree to VLIW instructions"""
 
     def __init__(self, program: ProgramNode):
         self.program = program
@@ -625,6 +810,12 @@ class GPKernelBuilder:
         return DebugInfo(scratch_map=self.scratch_debug)
 
     def alloc_scratch(self, name: Optional[str] = None, length: int = 1) -> int:
+        # Alignment for vectors if enabled
+        setup = self.program.setup
+        if setup.align_vectors and length >= VLEN:
+            if self.scratch_ptr % VLEN != 0:
+                self.scratch_ptr += VLEN - (self.scratch_ptr % VLEN)
+
         addr = self.scratch_ptr
         if name:
             self.scratch[name] = addr
@@ -647,7 +838,6 @@ class GPKernelBuilder:
         return self.const_map[val]
 
     def _get_slot_reads_writes(self, engine: str, slot: tuple) -> Tuple[set, set]:
-        """Extract data dependencies for scheduling"""
         reads, writes = set(), set()
         op = slot[0]
 
@@ -705,7 +895,6 @@ class GPKernelBuilder:
         return reads, writes
 
     def flush_schedule(self):
-        """Dependency-aware VLIW scheduling"""
         if not self.pending_slots:
             return
 
@@ -767,13 +956,9 @@ class GPKernelBuilder:
             self.flush_schedule()
 
     def build(self, forest_height: int, n_nodes: int, batch_size: int, rounds: int) -> List[dict]:
-        """Compile the GP tree into VLIW instructions"""
-
-        # Allocate temps
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
 
-        # Load header
         init_vars = ["rounds", "n_nodes", "batch_size", "forest_height",
                      "forest_values_p", "inp_indices_p", "inp_values_p"]
         for v in init_vars:
@@ -784,20 +969,14 @@ class GPKernelBuilder:
             self.emit("load", ("load", self.scratch[v], tmp1))
             self.flush_schedule()
 
-        # Setup phase
         self._compile_setup(self.program.setup)
-
         self.instrs.append({"flow": [("pause",)]})
-
-        # Main loop
         self._compile_loop(self.program.main_loop, batch_size, rounds)
-
         self.instrs.append({"flow": [("pause",)]})
 
         return self.instrs
 
     def _compile_setup(self, setup: SetupNode):
-        """Compile setup phase"""
         if setup.preload_scalars:
             for val in [0, 1, 2]:
                 self.get_const(val)
@@ -830,12 +1009,10 @@ class GPKernelBuilder:
             self.flush_schedule()
 
     def _compile_loop(self, loop: LoopNode, batch_size: int, rounds: int):
-        """Compile main loop"""
         n_chunks = loop.parallel_chunks
         chunk_size = VLEN
         chunks_per_round = batch_size // (chunk_size * n_chunks)
 
-        # Allocate chunk scratch
         chunk_scratch = []
         for c in range(n_chunks):
             p_idx = self.alloc_vector(f"p{c}_idx")
@@ -847,19 +1024,16 @@ class GPKernelBuilder:
             p_addr2 = self.alloc_scratch(f"p{c}_addr2")
             chunk_scratch.append((p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_addr1, p_addr2))
 
-        # Main iteration
         for r in range(rounds):
             for cg in range(chunks_per_round):
                 batch_indices = [cg * n_chunks * chunk_size + c * chunk_size
                                 for c in range(n_chunks)]
-
                 self._compile_phases(loop.body, chunk_scratch, batch_indices)
 
     def _compile_phases(self, seq: PhaseSequenceNode, chunk_scratch, batch_indices):
-        """Compile phase sequence"""
         n_chunks = len(chunk_scratch)
 
-        # Phase 1: Load indices and values
+        # Phase 1: Load
         for c, (p_idx, p_val, _, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
             self.emit("load", ("const", p_addr1, batch_indices[c]))
             self.emit("load", ("const", p_addr2, batch_indices[c]))
@@ -872,64 +1046,42 @@ class GPKernelBuilder:
             self.emit("load", ("vload", p_val, p_addr2))
         self.flush_schedule()
 
-        # Phase 2: Gather
+        # Gather
         self._compile_gather(seq.gather, chunk_scratch)
+        self.maybe_flush(seq.flush_after_gather)
 
         # XOR
         for c, (p_idx, p_val, p_node_val, _, _, _, _) in enumerate(chunk_scratch):
             self.emit("valu", ("^", p_val, p_val, p_node_val))
-        self.flush_schedule()
+        self.maybe_flush(seq.hash_comp.flush_after_xor)
 
-        # Phase 3: Hash
+        # Hash
         self._compile_hash(seq.hash_comp, chunk_scratch)
+        self.maybe_flush(seq.flush_after_hash)
 
-        # Phase 4: Index
+        # Index
         self._compile_index(seq.index_comp, chunk_scratch)
+        self.maybe_flush(seq.flush_after_index)
 
-        # Phase 5: Store
+        # Store
         self._compile_store(seq.store, chunk_scratch, batch_indices)
 
     def _compile_gather(self, gather: GatherNode, chunk_scratch):
-        """Compile gather phase based on strategy"""
         n_chunks = len(chunk_scratch)
 
-        if gather.strategy == GatherStrategy.SEQUENTIAL:
-            for vi in range(VLEN):
-                for c, (p_idx, _, p_node_val, _, _, p_addr1, _) in enumerate(chunk_scratch):
-                    self.emit("alu", ("+", p_addr1, self.scratch["forest_values_p"], p_idx + vi))
+        for vi in range(VLEN):
+            for c, (p_idx, _, p_node_val, _, _, p_addr1, _) in enumerate(chunk_scratch):
+                self.emit("alu", ("+", p_addr1, self.scratch["forest_values_p"], p_idx + vi))
+            self.maybe_flush(gather.flush_after_addr)
+            for c, (p_idx, _, p_node_val, _, _, p_addr1, _) in enumerate(chunk_scratch):
+                self.emit("load", ("load", p_node_val + vi, p_addr1))
+                if (c + 1) % 2 == 0:
+                    self.flush_schedule()
+            if n_chunks % 2 != 0:
                 self.flush_schedule()
-                for c, (p_idx, _, p_node_val, _, _, p_addr1, _) in enumerate(chunk_scratch):
-                    self.emit("load", ("load", p_node_val + vi, p_addr1))
-                    if (c + 1) % 2 == 0:
-                        self.flush_schedule()
-                if n_chunks % 2 != 0:
-                    self.flush_schedule()
-
-        elif gather.strategy == GatherStrategy.DUAL_ADDR:
-            for vi in range(0, VLEN, 2):
-                for c, (p_idx, _, p_node_val, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
-                    self.emit("alu", ("+", p_addr1, self.scratch["forest_values_p"], p_idx + vi))
-                    self.emit("alu", ("+", p_addr2, self.scratch["forest_values_p"], p_idx + vi + 1))
-                self.flush_schedule()
-                for c, (p_idx, _, p_node_val, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
-                    self.emit("load", ("load", p_node_val + vi, p_addr1))
-                    self.emit("load", ("load", p_node_val + vi + 1, p_addr2))
-                    self.flush_schedule()
-
-        elif gather.strategy in (GatherStrategy.BATCH_ADDR, GatherStrategy.PIPELINED):
-            for vi in range(VLEN):
-                for c, (p_idx, _, p_node_val, _, _, p_addr1, _) in enumerate(chunk_scratch):
-                    self.emit("alu", ("+", p_addr1, self.scratch["forest_values_p"], p_idx + vi))
-                self.maybe_flush(gather.flush_after_addr)
-                for c, (p_idx, _, p_node_val, _, _, p_addr1, _) in enumerate(chunk_scratch):
-                    self.emit("load", ("load", p_node_val + vi, p_addr1))
-                    if (c + 1) % 2 == 0:
-                        self.flush_schedule()
-                if n_chunks % 2 != 0:
-                    self.flush_schedule()
+            self.maybe_flush(gather.flush_per_element)
 
     def _compile_hash(self, hash_node: HashNode, chunk_scratch):
-        """Compile hash phase based on strategy"""
         has_preloaded = hash_node.use_preloaded_consts and len(self.vec_const_map) > 3
 
         for op1, val1, op2, op3, val3 in HASH_STAGES:
@@ -957,7 +1109,6 @@ class GPKernelBuilder:
         self.flush_schedule()
 
     def _compile_index(self, index_node: IndexNode, chunk_scratch):
-        """Compile index computation based on strategy"""
         has_preloaded = index_node.use_preloaded_consts and 2 in self.vec_const_map
         has_n_nodes = "n_nodes" in self.vec_const_map
 
@@ -965,70 +1116,50 @@ class GPKernelBuilder:
             vc_zero = self.vec_const_map[0]
             vc_one = self.vec_const_map[1]
             vc_two = self.vec_const_map[2]
-        else:
-            vc_zero = vc_one = vc_two = None
 
-        if index_node.strategy == IndexStrategy.VSELECT and has_preloaded:
-            # val % 2 and 2*idx
             for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
                 self.emit("valu", ("%", p_tmp2, p_val, vc_two))
                 self.emit("valu", ("*", p_idx, p_idx, vc_two))
-            self.flush_schedule()
-            # == 0
+            self.maybe_flush(index_node.flush_after_mod)
+
             for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
                 self.emit("valu", ("==", p_tmp2, p_tmp2, vc_zero))
             self.flush_schedule()
-            # vselect
-            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
-                self.emit("flow", ("vselect", p_tmp1, p_tmp2, vc_one, vc_two))
-            self.flush_schedule()
-            # add
+
+            if index_node.strategy == IndexStrategy.VSELECT:
+                for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+                    self.emit("flow", ("vselect", p_tmp1, p_tmp2, vc_one, vc_two))
+                self.flush_schedule()
+            else:
+                for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+                    self.emit("valu", ("-", p_tmp1, vc_two, p_tmp2))
+                self.flush_schedule()
+
+            self.maybe_flush(index_node.flush_after_mul)
+
             for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
                 self.emit("valu", ("+", p_idx, p_idx, p_tmp1))
             self.flush_schedule()
 
-        elif index_node.strategy == IndexStrategy.ARITHMETIC and has_preloaded:
-            # val % 2
-            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
-                self.emit("valu", ("%", p_tmp2, p_val, vc_two))
-            self.flush_schedule()
-            # == 0
-            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
-                self.emit("valu", ("==", p_tmp2, p_tmp2, vc_zero))
-            self.flush_schedule()
-            # offset = 2 - cond
-            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
-                self.emit("valu", ("-", p_tmp1, vc_two, p_tmp2))
-            self.flush_schedule()
-            # 2*idx
-            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
-                self.emit("valu", ("*", p_idx, p_idx, vc_two))
-            self.flush_schedule()
-            # add offset
-            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
-                self.emit("valu", ("+", p_idx, p_idx, p_tmp1))
+            # Bounds
+            if has_n_nodes:
+                vc_n = self.vec_const_map["n_nodes"]
+                for c, (p_idx, _, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+                    self.emit("valu", ("<", p_tmp2, p_idx, vc_n))
+            else:
+                for c, (p_idx, _, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+                    self.emit("valu", ("vbroadcast", p_tmp1, self.scratch["n_nodes"]))
+                self.flush_schedule()
+                for c, (p_idx, _, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+                    self.emit("valu", ("<", p_tmp2, p_idx, p_tmp1))
             self.flush_schedule()
 
-        elif index_node.strategy == IndexStrategy.MULTIPLY_ADD and has_preloaded:
-            # val % 2
-            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
-                self.emit("valu", ("%", p_tmp2, p_val, vc_two))
-            self.flush_schedule()
-            # == 0
-            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
-                self.emit("valu", ("==", p_tmp2, p_tmp2, vc_zero))
-            self.flush_schedule()
-            # offset = 2 - cond
-            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
-                self.emit("valu", ("-", p_tmp1, vc_two, p_tmp2))
-            self.flush_schedule()
-            # multiply_add: idx = idx*2 + offset
-            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
-                self.emit("valu", ("multiply_add", p_idx, p_idx, vc_two, p_tmp1))
+            for c, (p_idx, _, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+                self.emit("valu", ("*", p_idx, p_idx, p_tmp2))
             self.flush_schedule()
 
         else:
-            # Fallback to VSELECT with broadcasts
+            # Fallback without preloaded constants
             for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
                 self.emit("valu", ("vbroadcast", p_tmp1, self.get_const(2)))
             self.flush_schedule()
@@ -1049,26 +1180,18 @@ class GPKernelBuilder:
                 self.emit("valu", ("+", p_idx, p_idx, p_tmp1))
             self.flush_schedule()
 
-        # Bounds check
-        if has_n_nodes:
-            vc_n = self.vec_const_map["n_nodes"]
-            for c, (p_idx, _, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
-                self.emit("valu", ("<", p_tmp2, p_idx, vc_n))
-        else:
+            # Bounds
             for c, (p_idx, _, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
                 self.emit("valu", ("vbroadcast", p_tmp1, self.scratch["n_nodes"]))
             self.flush_schedule()
             for c, (p_idx, _, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
                 self.emit("valu", ("<", p_tmp2, p_idx, p_tmp1))
-        self.flush_schedule()
-
-        # idx = idx * inbounds (arithmetic bounds)
-        for c, (p_idx, _, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
-            self.emit("valu", ("*", p_idx, p_idx, p_tmp2))
-        self.flush_schedule()
+            self.flush_schedule()
+            for c, (p_idx, _, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+                self.emit("valu", ("*", p_idx, p_idx, p_tmp2))
+            self.flush_schedule()
 
     def _compile_store(self, store: StoreNode, chunk_scratch, batch_indices):
-        """Compile store phase"""
         for c, (p_idx, p_val, _, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
             self.emit("load", ("const", p_addr1, batch_indices[c]))
             self.emit("load", ("const", p_addr2, batch_indices[c]))
@@ -1093,42 +1216,40 @@ TEST_BATCH_SIZE = 256
 TEST_SEED = 123
 
 
-def evaluate_program(program: ProgramNode, timeout_cycles: int = 50000, use_numba: bool = True) -> float:
-    """Evaluate a GP tree by compiling and running it"""
+def evaluate_program(program: ProgramNode, timeout_cycles: int = 50000) -> float:
     try:
         random.seed(TEST_SEED)
         forest = Tree.generate(TEST_FOREST_HEIGHT)
         inp = Input.generate(forest, TEST_BATCH_SIZE, TEST_ROUNDS)
         mem = build_mem_image(forest, inp)
 
-        builder = GPKernelBuilder(program)
+        builder = GPKernelBuilderV2(program)
         instrs = builder.build(forest.height, len(forest.values),
                                len(inp.indices), TEST_ROUNDS)
 
-        if use_numba:
-            try:
-                from numba_machine import NumbaMachine
-                machine = NumbaMachine(mem, instrs)
-                machine.enable_pause = True
+        try:
+            from numba_machine import NumbaMachine
+            machine = NumbaMachine(mem, instrs)
+            machine.enable_pause = True
 
-                ref_gen = reference_kernel2(list(mem), {})
-                ref_mem = None
-                for ref_mem in ref_gen:
-                    machine.run(max_cycles=timeout_cycles)
-                    if machine.cycle >= timeout_cycles:
-                        return float('inf')
+            ref_gen = reference_kernel2(list(mem), {})
+            ref_mem = None
+            for ref_mem in ref_gen:
+                machine.run(max_cycles=timeout_cycles)
+                if machine.cycle >= timeout_cycles:
+                    return float('inf')
 
-                if ref_mem is not None:
-                    inp_values_p = ref_mem[6]
-                    if list(machine.mem[inp_values_p:inp_values_p + TEST_BATCH_SIZE]) != \
-                       ref_mem[inp_values_p:inp_values_p + TEST_BATCH_SIZE]:
-                        return float('inf')
+            if ref_mem is not None:
+                inp_values_p = ref_mem[6]
+                if list(machine.mem[inp_values_p:inp_values_p + TEST_BATCH_SIZE]) != \
+                   ref_mem[inp_values_p:inp_values_p + TEST_BATCH_SIZE]:
+                    return float('inf')
 
-                return float(machine.cycle)
-            except ImportError:
-                pass  # Fall back to original
+            return float(machine.cycle)
+        except ImportError:
+            pass
 
-        # Original (slow) implementation
+        # Fallback
         machine = Machine(mem, instrs, builder.debug_info(), n_cores=N_CORES)
         machine.enable_pause = True
         machine.enable_debug = False
@@ -1147,34 +1268,70 @@ def evaluate_program(program: ProgramNode, timeout_cycles: int = 50000, use_numb
                 return float('inf')
 
         return float(machine.cycle)
-    except Exception as e:
+    except Exception:
         return float('inf')
 
 
 # =============================================================================
-# GP Algorithm
+# GP Algorithm with Diversity
 # =============================================================================
 
-class GeneticProgramming:
+def fitness_sharing(fitnesses: List[float], population: List[ProgramNode], sigma: float = 0.3) -> List[float]:
+    """Apply fitness sharing to maintain diversity"""
+    n = len(population)
+    shared = fitnesses.copy()
+
+    for i in range(n):
+        if fitnesses[i] == float('inf'):
+            continue
+        niche_count = 1.0
+        for j in range(n):
+            if i != j and fitnesses[j] != float('inf'):
+                # Simple similarity: same structure and chunks
+                sim = 0.0
+                if population[i].main_loop.structure == population[j].main_loop.structure:
+                    sim += 0.3
+                if population[i].main_loop.parallel_chunks == population[j].main_loop.parallel_chunks:
+                    sim += 0.3
+                if population[i].main_loop.body.gather.strategy == population[j].main_loop.body.gather.strategy:
+                    sim += 0.2
+                if population[i].main_loop.body.hash_comp.strategy == population[j].main_loop.body.hash_comp.strategy:
+                    sim += 0.2
+
+                if sim > sigma:
+                    niche_count += 1.0 - (sim - sigma) / (1.0 - sigma)
+
+        shared[i] = fitnesses[i] * niche_count
+
+    return shared
+
+
+class GeneticProgrammingV2:
     def __init__(
         self,
         population_size: int = 50,
         generations: int = 100,
-        crossover_rate: float = 0.7,
-        point_mutation_rate: float = 0.2,
-        subtree_mutation_rate: float = 0.1,
-        elitism: int = 3,
+        crossover_rate: float = 0.6,
+        point_mutation_rate: float = 0.25,
+        subtree_mutation_rate: float = 0.15,
+        structure_mutation_rate: float = 0.1,  # Add/remove nested loops
+        elitism: int = 2,
         tournament_size: int = 3,
-        max_depth: int = 10,
+        max_depth: int = 5,
+        random_immigrant_rate: float = 0.1,  # Inject fresh random trees
+        use_fitness_sharing: bool = True,
     ):
         self.population_size = population_size
         self.generations = generations
         self.crossover_rate = crossover_rate
         self.point_mutation_rate = point_mutation_rate
         self.subtree_mutation_rate = subtree_mutation_rate
+        self.structure_mutation_rate = structure_mutation_rate
         self.elitism = elitism
         self.tournament_size = tournament_size
         self.max_depth = max_depth
+        self.random_immigrant_rate = random_immigrant_rate
+        self.use_fitness_sharing = use_fitness_sharing
 
         self.population: List[ProgramNode] = []
         self.fitnesses: List[float] = []
@@ -1183,28 +1340,32 @@ class GeneticProgramming:
         self.history: List[dict] = []
 
     def initialize_population(self):
-        """Create initial population with seeded diversity"""
         self.population = []
 
-        # Seed with different strategies
-        for seed_type in ["baseline", "minimal_flush", "max_parallel", "conservative"]:
+        # Seeded diversity
+        for seed_type in ["baseline", "minimal_flush", "max_parallel", "deep_nested"]:
             self.population.append(seeded_program(seed_type))
 
-        # Fill with random
+        # Random with varying depths
         while len(self.population) < self.population_size:
-            self.population.append(random_program())
+            depth = random.randint(2, self.max_depth)
+            self.population.append(random_program(depth))
 
-    def tournament_select(self) -> ProgramNode:
-        """Tournament selection"""
+    def tournament_select(self, use_shared: bool = True) -> ProgramNode:
+        fits = self.shared_fitnesses if use_shared and self.use_fitness_sharing else self.fitnesses
         indices = random.sample(range(len(self.population)), self.tournament_size)
-        best_idx = min(indices, key=lambda i: self.fitnesses[i])
+        best_idx = min(indices, key=lambda i: fits[i])
         return self.population[best_idx].clone()
 
     def evaluate_population(self):
-        """Evaluate all programs"""
         timeout = int(self.best_fitness * 1.5) if self.best_fitness < float('inf') else 50000
 
         self.fitnesses = [evaluate_program(p, timeout) for p in self.population]
+
+        if self.use_fitness_sharing:
+            self.shared_fitnesses = fitness_sharing(self.fitnesses, self.population)
+        else:
+            self.shared_fitnesses = self.fitnesses
 
         for i, fitness in enumerate(self.fitnesses):
             if fitness < self.best_fitness:
@@ -1212,36 +1373,44 @@ class GeneticProgramming:
                 self.best_program = self.population[i].clone()
 
     def evolve_generation(self):
-        """Create next generation using GP operators"""
         new_population = []
 
-        # Elitism
+        # Elitism (use raw fitness, not shared)
         sorted_indices = sorted(range(len(self.fitnesses)), key=lambda i: self.fitnesses[i])
         for i in range(self.elitism):
             if self.fitnesses[sorted_indices[i]] < float('inf'):
                 new_population.append(self.population[sorted_indices[i]].clone())
+
+        # Random immigrants
+        n_immigrants = int(self.population_size * self.random_immigrant_rate)
+        for _ in range(n_immigrants):
+            depth = random.randint(2, self.max_depth)
+            new_population.append(random_program(depth))
 
         # Fill with offspring
         while len(new_population) < self.population_size:
             op = random.random()
 
             if op < self.crossover_rate:
-                # Subtree crossover
                 p1 = self.tournament_select()
                 p2 = self.tournament_select()
                 child = subtree_crossover(p1, p2)
 
             elif op < self.crossover_rate + self.subtree_mutation_rate:
-                # Subtree mutation
                 parent = self.tournament_select()
-                child = subtree_mutation(parent)
+                child = subtree_mutation(parent, self.max_depth)
+
+            elif op < self.crossover_rate + self.subtree_mutation_rate + self.structure_mutation_rate:
+                parent = self.tournament_select()
+                if random.random() < 0.5:
+                    child = add_nested_loop(parent)
+                else:
+                    child = remove_nested_loop(parent)
 
             else:
-                # Point mutation
                 parent = self.tournament_select()
                 child = point_mutation(parent, self.point_mutation_rate)
 
-            # Depth limiting
             if child.depth() <= self.max_depth:
                 new_population.append(child)
             else:
@@ -1250,8 +1419,8 @@ class GeneticProgramming:
         self.population = new_population
 
     def run(self, verbose: bool = True) -> Tuple[ProgramNode, float]:
-        """Run the GP algorithm"""
-        print(f"Starting GP: {self.population_size} individuals, {self.generations} generations")
+        print(f"Starting GP V2: {self.population_size} individuals, {self.generations} generations")
+        print(f"  Random immigrants: {self.random_immigrant_rate*100:.0f}%, Fitness sharing: {self.use_fitness_sharing}")
         print()
 
         self.initialize_population()
@@ -1264,19 +1433,28 @@ class GeneticProgramming:
             avg = sum(valid) / len(valid) if valid else float('inf')
             gen_best = min(valid) if valid else float('inf')
 
+            # Diversity metric
+            unique_strategies = len(set(
+                (p.main_loop.structure, p.main_loop.parallel_chunks,
+                 p.main_loop.body.gather.strategy, p.main_loop.body.hash_comp.strategy)
+                for p in self.population
+            ))
+
             self.history.append({
                 'generation': gen,
                 'best_fitness': self.best_fitness,
                 'gen_best': gen_best,
                 'gen_avg': avg,
                 'valid_count': len(valid),
+                'unique_strategies': unique_strategies,
                 'time': time.time() - start,
             })
 
             if verbose:
                 print(f"Gen {gen:3d}: best={self.best_fitness:,.0f}, "
-                      f"gen_best={gen_best:,.0f}, gen_avg={avg:,.0f}, "
+                      f"gen_best={gen_best:,.0f}, avg={avg:,.0f}, "
                       f"valid={len(valid)}/{self.population_size}, "
+                      f"diversity={unique_strategies}, "
                       f"time={time.time()-start:.1f}s")
 
             if self.best_fitness < 1500:
@@ -1288,102 +1466,44 @@ class GeneticProgramming:
         print(f"\nBest: {self.best_fitness:,.0f} cycles")
         if self.best_program:
             loop = self.best_program.main_loop
-            phases = loop.body
             print(f"Structure: {loop.structure.value}, chunks={loop.parallel_chunks}")
-            print(f"  Gather: {phases.gather.strategy.value}")
-            print(f"  Hash: {phases.hash_comp.strategy.value}")
-            print(f"  Index: {phases.index_comp.strategy.value}")
+            print(f"  Unroll: batch={loop.batch_unroll}, round={loop.round_unroll}")
+            print(f"  Gather: {loop.body.gather.strategy.value}")
+            print(f"  Hash: {loop.body.hash_comp.strategy.value}")
+            print(f"  Index: {loop.body.index_comp.strategy.value}")
+            print(f"  Depth: {self.best_program.depth()}")
 
         return self.best_program, self.best_fitness
 
-    def save_results(self, filename: str = "gp_results.json"):
-        """Save results to file"""
-        def serialize_node(node: GPNode) -> dict:
-            if isinstance(node, ProgramNode):
-                return {
-                    'type': 'Program',
-                    'setup': serialize_node(node.setup),
-                    'main_loop': serialize_node(node.main_loop)
-                }
-            elif isinstance(node, SetupNode):
-                return {
-                    'type': 'Setup',
-                    'preload_scalars': node.preload_scalars,
-                    'preload_vectors': node.preload_vectors,
-                    'preload_hash_consts': node.preload_hash_consts,
-                    'preload_n_nodes': node.preload_n_nodes
-                }
-            elif isinstance(node, LoopNode):
-                return {
-                    'type': 'Loop',
-                    'structure': node.structure.value,
-                    'parallel_chunks': node.parallel_chunks,
-                    'body': serialize_node(node.body)
-                }
-            elif isinstance(node, PhaseSequenceNode):
-                return {
-                    'type': 'PhaseSequence',
-                    'gather': serialize_node(node.gather),
-                    'hash': serialize_node(node.hash_comp),
-                    'index': serialize_node(node.index_comp),
-                    'store': serialize_node(node.store)
-                }
-            elif isinstance(node, GatherNode):
-                return {
-                    'type': 'Gather',
-                    'strategy': node.strategy.value,
-                    'flush_after_addr': node.flush_after_addr,
-                    'flush_per_element': node.flush_per_element
-                }
-            elif isinstance(node, HashNode):
-                return {
-                    'type': 'Hash',
-                    'strategy': node.strategy.value,
-                    'flush_per_stage': node.flush_per_stage,
-                    'use_preloaded_consts': node.use_preloaded_consts
-                }
-            elif isinstance(node, IndexNode):
-                return {
-                    'type': 'Index',
-                    'strategy': node.strategy.value,
-                    'flush_per_op': node.flush_per_op,
-                    'use_preloaded_consts': node.use_preloaded_consts
-                }
-            elif isinstance(node, StoreNode):
-                return {
-                    'type': 'Store',
-                    'flush_after_addr': node.flush_after_addr
-                }
-            return {}
-
+    def save_results(self, filename: str = "gp_v2_results.json"):
         results = {
             'best_fitness': self.best_fitness,
-            'best_program': serialize_node(self.best_program) if self.best_program else None,
             'history': self.history,
         }
-
         with open(filename, 'w') as f:
             json.dump(results, f, indent=2)
         print(f"Saved to {filename}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description='GP optimizer for VLIW kernel')
+    parser = argparse.ArgumentParser(description='GP V2 optimizer')
     parser.add_argument('--generations', '-g', type=int, default=30)
-    parser.add_argument('--population', '-p', type=int, default=40)
-    parser.add_argument('--output', '-o', type=str, default='gp_results.json')
+    parser.add_argument('--population', '-p', type=int, default=50)
+    parser.add_argument('--immigrants', '-i', type=float, default=0.1)
+    parser.add_argument('--no-sharing', action='store_true')
+    parser.add_argument('--output', '-o', type=str, default='gp_v2_results.json')
 
     args = parser.parse_args()
 
-    gp = GeneticProgramming(
+    gp = GeneticProgrammingV2(
         population_size=args.population,
         generations=args.generations,
+        random_immigrant_rate=args.immigrants,
+        use_fitness_sharing=not args.no_sharing,
     )
 
     best_program, best_fitness = gp.run()
     gp.save_results(args.output)
-
-    print(f"\nSpeedup over baseline: {147734 / best_fitness:.2f}x")
 
 
 if __name__ == "__main__":
