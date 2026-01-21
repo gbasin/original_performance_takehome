@@ -299,6 +299,46 @@ class FusionMode(Enum):
 
 
 # =============================================================================
+# Extension 7: Smart Scheduling# =============================================================================
+
+class SchedulerType(Enum):
+    """Scheduling strategy for VLIW instruction packing"""
+    GREEDY = "greedy"                # Pack slots greedily (current default)
+    TIME_BASED = "time_based"        # Schedule at earliest time respecting latencies
+    WAVE_INTERLEAVED = "wave_interleaved"  # Interleave operations across waves
+
+
+class MemoryLayout(Enum):
+    """Scratch memory organization strategy"""
+    FLAT = "flat"                    # All allocations sequential (current default)
+    SEGMENTED = "segmented"          # Separate regions: IDX, VAL, CACHE, TMP
+
+
+class GeneratorEmission(Enum):
+    """Operation emission pattern for wave-based execution"""
+    PHASE_BASED = "phase_based"      # Emit by phase, flush between phases
+    GENERATOR_YIELD = "generator"    # Yield op batches per logical step for interleaving
+
+
+class GatherLoadMode(Enum):
+    """Load instruction type for gather phase"""
+    VLOAD = "vload"                  # Vector load (requires contiguous addresses)
+    SCALAR_LOAD = "scalar_load"      # Individual scalar loads (for scatter-gather)
+
+
+class BatchRegisterLayout(Enum):
+    """Per-batch temporary register allocation strategy"""
+    DYNAMIC = "dynamic"              # Allocate registers as needed
+    FIXED_32 = "fixed_32"            # Fixed 32-reg block: NODE=0, ADDR=8, TMP1=16, TMP2=24
+
+
+class WaveScheduling(Enum):
+    """Wave execution scheduling strategy"""
+    PHASE_FLUSH = "phase_flush"      # Flush after each phase within wave
+    ROUND_ROBIN = "round_robin"      # Round-robin across batch generators
+
+
+# =============================================================================
 # Extended Phase Nodes with Fine-Grained Unrolling (Extension 4)
 # =============================================================================
 
@@ -560,6 +600,16 @@ class LoopNode(GPNode):
     # Algorithmic optimizations
     loop_order: str = "round_first"  # "round_first" | "chunk_first"
     skip_indices: bool = False       # Skip loading/storing indices (requires chunk_first)
+    # Extension 7: Smart scheduling
+    wave_size: int = 0               # Batches per wave (0 = disabled, 8/16/32 = wave-based)
+    scheduler_type: SchedulerType = SchedulerType.GREEDY
+    memory_layout: MemoryLayout = MemoryLayout.FLAT
+    bulk_load: bool = False          # Load ALL data upfront (vs per-iteration)
+    # Extension 8: Generator-based emission and wave scheduling
+    generator_emission: GeneratorEmission = GeneratorEmission.PHASE_BASED
+    gather_load_mode: GatherLoadMode = GatherLoadMode.VLOAD
+    batch_reg_layout: BatchRegisterLayout = BatchRegisterLayout.DYNAMIC
+    wave_scheduling: WaveScheduling = WaveScheduling.PHASE_FLUSH
 
     @property
     def node_type(self) -> GPType:
@@ -593,7 +643,15 @@ class LoopNode(GPNode):
             chunk_unroll=self.chunk_unroll,
             tile_size=self.tile_size,
             loop_order=self.loop_order,
-            skip_indices=self.skip_indices
+            skip_indices=self.skip_indices,
+            wave_size=self.wave_size,
+            scheduler_type=self.scheduler_type,
+            memory_layout=self.memory_layout,
+            bulk_load=self.bulk_load,
+            generator_emission=self.generator_emission,
+            gather_load_mode=self.gather_load_mode,
+            batch_reg_layout=self.batch_reg_layout,
+            wave_scheduling=self.wave_scheduling
         )
 
 
@@ -753,6 +811,50 @@ def random_loop() -> LoopNode:
     parallel_chunks = random.choice([8, 16, 16, 32, 32])  # Favor higher parallelism
     # Tiling: 0 = no tiling, or tile to smaller sizes for large chunk counts
     tile_size = 0 if parallel_chunks <= 8 else random.choice([0, 0, 4, 8])
+
+    # Extension 7: Smart scheduling
+    # Wave size: 0 = disabled, 8/16/32 = wave-based execution
+    # Higher wave sizes allow more latency hiding but require more registers
+    wave_size = random.choice([0, 0, 0, 8, 16])  # Mostly disabled, sometimes try wave-based
+    scheduler_type = random.choice([
+        SchedulerType.GREEDY,  # Default
+        SchedulerType.GREEDY,  # Favor greedy
+        SchedulerType.TIME_BASED,
+        SchedulerType.WAVE_INTERLEAVED
+    ])
+    memory_layout = random.choice([MemoryLayout.FLAT, MemoryLayout.FLAT, MemoryLayout.SEGMENTED])
+    bulk_load = random.choice([False, False, True])  # Mostly disabled
+
+    # Extension 8: Generator-based emission and wave scheduling
+    # When wave_size > 0, favor generator-based approach with scalar loads
+    if wave_size > 0:
+        generator_emission = random.choice([
+            GeneratorEmission.GENERATOR_YIELD,
+            GeneratorEmission.GENERATOR_YIELD,  # Favor generator
+            GeneratorEmission.PHASE_BASED
+        ])
+        # Scatter-gather requires scalar loads for non-contiguous addresses
+        gather_load_mode = random.choice([
+            GatherLoadMode.SCALAR_LOAD,
+            GatherLoadMode.SCALAR_LOAD,  # Favor scalar for correctness
+            GatherLoadMode.VLOAD
+        ])
+        batch_reg_layout = random.choice([
+            BatchRegisterLayout.FIXED_32,
+            BatchRegisterLayout.FIXED_32,  # Favor fixed for predictability
+            BatchRegisterLayout.DYNAMIC
+        ])
+        wave_scheduling = random.choice([
+            WaveScheduling.ROUND_ROBIN,
+            WaveScheduling.ROUND_ROBIN,  # Favor round-robin
+            WaveScheduling.PHASE_FLUSH
+        ])
+    else:
+        generator_emission = GeneratorEmission.PHASE_BASED
+        gather_load_mode = random.choice(list(GatherLoadMode))
+        batch_reg_layout = BatchRegisterLayout.DYNAMIC
+        wave_scheduling = WaveScheduling.PHASE_FLUSH
+
     return LoopNode(
         structure=random.choice(list(LoopStructure)),
         parallel_chunks=parallel_chunks,
@@ -765,7 +867,15 @@ def random_loop() -> LoopNode:
         chunk_unroll=random.choice([1, 2]),
         tile_size=tile_size,
         loop_order=loop_order,
-        skip_indices=skip_indices
+        skip_indices=skip_indices,
+        wave_size=wave_size,
+        scheduler_type=scheduler_type,
+        memory_layout=memory_layout,
+        bulk_load=bulk_load,
+        generator_emission=generator_emission,
+        gather_load_mode=gather_load_mode,
+        batch_reg_layout=batch_reg_layout,
+        wave_scheduling=wave_scheduling
     )
 
 
@@ -892,6 +1002,41 @@ def seeded_program(seed_type: str) -> ProgramNode:
                 registers=RegisterNode(),
                 loop_order="chunk_first",  # Process all rounds per chunk
                 skip_indices=True          # Don't load/store indices
+            )
+        )
+
+    elif seed_type == "wave_based":
+        # Wave-based execution with generator emission and round-robin scheduling
+        # Process batches in waves of 16, using time-based scheduling
+        return ProgramNode(
+            setup=SetupNode(True, True, True, True),
+            main_loop=LoopNode(
+                structure=LoopStructure.CHUNKED,
+                parallel_chunks=16,
+                body=PhaseSequenceNode(
+                    gather=GatherNode(GatherStrategy.BATCH_ADDR, False, False),
+                    hash_comp=HashNode(HashStrategy.FUSED, False, True),
+                    index_comp=IndexNode(IndexStrategy.MULTIPLY_ADD, False, True,
+                                        index_formula="bitwise"),
+                    store=StoreNode(False)
+                ),
+                pipeline=PipelineNode(enabled=False),
+                interleave=InterleaveNode(strategy=InterleaveStrategy.ALL_PHASES,
+                                         lookahead_depth=4),
+                memory=MemoryNode(address_gen=AddressGenStrategy.EAGER),
+                registers=RegisterNode(),
+                loop_order="chunk_first",
+                skip_indices=True,
+                # Extension 7: Wave-based scheduling
+                wave_size=16,  # Process 16 batches per wave
+                scheduler_type=SchedulerType.WAVE_INTERLEAVED,
+                memory_layout=MemoryLayout.SEGMENTED,
+                bulk_load=True,  # Load all data upfront
+                # Extension 8: Generator-based emission
+                generator_emission=GeneratorEmission.GENERATOR_YIELD,
+                gather_load_mode=GatherLoadMode.SCALAR_LOAD,
+                batch_reg_layout=BatchRegisterLayout.FIXED_32,
+                wave_scheduling=WaveScheduling.ROUND_ROBIN
             )
         )
 
@@ -1134,8 +1279,77 @@ def subtree_mutation(tree: ProgramNode) -> ProgramNode:
 # Code Generator with All Extensions
 # =============================================================================
 
+# Operation latencies for different instruction types (in cycles)
+OP_LATENCIES = {
+    "alu": 1,
+    "valu": 1,
+    "load": 3,      # Memory loads have higher latency
+    "store": 1,
+    "flow": 1,
+}
+
+
+@dataclass
+class Op:
+    """Operation descriptor for SmartScheduler"""
+    engine: str
+    args: tuple
+    latency: int = 1
+
+    def __post_init__(self):
+        # Set latency based on engine type if not explicitly provided
+        if self.latency == 1 and self.engine in OP_LATENCIES:
+            self.latency = OP_LATENCIES[self.engine]
+
+
+class SmartScheduler:
+    """Time-based list scheduling algorithm.
+
+    Tracks operation latencies and schedules at earliest time respecting slot limits.
+    This enables better latency hiding by interleaving operations from different batches.
+    """
+
+    def __init__(self, limits: dict):
+        self.limits = limits
+        self.bundles: List[dict] = []  # List of {engine: [slots]}
+
+    def schedule(self, op: Op, min_time: int) -> int:
+        """Schedule op at earliest time t >= min_time satisfying slot limits.
+
+        Returns the cycle at which the operation was scheduled.
+        """
+        t = min_time
+        while True:
+            # Expand bundles if needed
+            while len(self.bundles) <= t:
+                self.bundles.append({})
+
+            bundle = self.bundles[t]
+            current_count = len(bundle.get(op.engine, []))
+            limit = self.limits.get(op.engine, 0)
+
+            if current_count < limit:
+                if op.engine not in bundle:
+                    bundle[op.engine] = []
+                bundle[op.engine].append(op.args)
+                return t
+            t += 1
+
+    def get_instrs(self) -> List[dict]:
+        """Convert scheduled bundles to instruction list."""
+        # Filter out empty bundles
+        return [b for b in self.bundles if b]
+
+
 class GPKernelBuilderV4:
     """Compiles a GP V4 tree into VLIW instructions with activated optimizations"""
+
+    # Segmented memory layout constants
+    # Total scratch = 1536 registers
+    IDX_BASE = 0           # Indices at 0-255
+    VAL_BASE = 256         # Values at 256-511
+    CACHE_BASE = 512       # Hash constants at 512-1023 (unused region in flat mode)
+    TMP_BASE = 1024        # Batch temporaries at 1024-1535
 
     def __init__(self, program: ProgramNode):
         self.program = program
@@ -1167,6 +1381,12 @@ class GPKernelBuilderV4:
         self._live_regs: set = set()  # Currently live registers for reuse tracking
         self._spilled_regs: dict = {}  # reg -> spill address
         self._temps_reserved: int = 0  # Count of reserved temp registers
+
+        # Extension 7: Smart scheduling state
+        self._memory_layout: MemoryLayout = MemoryLayout.FLAT
+        self._scheduler_type: SchedulerType = SchedulerType.GREEDY
+        self._smart_scheduler: Optional[SmartScheduler] = None
+        self._batch_times: dict = {}  # For wave-based scheduling: batch_id -> time available
 
     def debug_info(self) -> DebugInfo:
         return DebugInfo(scratch_map=self.scratch_debug)
@@ -1745,6 +1965,13 @@ class GPKernelBuilderV4:
                                         outer_unroll, skip_indices, n_chunks, chunk_size)
             return
 
+        # Extension 7: Wave-based execution        # Process batches in waves to maximize register reuse
+        if loop.wave_size > 0 and loop.scheduler_type != SchedulerType.GREEDY:
+            self._compile_loop_wave_based(loop, chunk_scratch, chunks_per_round, rounds,
+                                          skip_indices, n_chunks, chunk_size, effective_chunks,
+                                          n_tiles, batch_size)
+            return
+
         if structure == LoopStructure.FUSED:
             # FUSED: Process multiple rounds worth of data with minimal flushing
             # This maximizes instruction-level parallelism across rounds
@@ -1821,6 +2048,411 @@ class GPKernelBuilderV4:
 
                             self._compile_phases(loop.body, tile_chunk_scratch, batch_indices, loop,
                                                skip_indices=False)
+
+    def _compile_loop_wave_based(self, loop: LoopNode, chunk_scratch, chunks_per_round: int,
+                                  rounds: int, skip_indices: bool, n_chunks: int, chunk_size: int,
+                                  effective_chunks: int, n_tiles: int, batch_size: int):
+        """Wave-based execution.
+
+        Process batches in waves, reusing temporary registers between waves.
+        Uses SmartScheduler for time-based scheduling to hide latencies.
+
+        Key ideas:
+        - Process 16 batches through ALL rounds (Wave 1), then next 16 (Wave 2)
+        - Reuse same temporary registers between waves
+        - Use time-based scheduling to interleave operations across batches
+        """
+        # Extension 8: Use generator-based approach when configured
+        if (loop.generator_emission == GeneratorEmission.GENERATOR_YIELD and
+            loop.wave_scheduling == WaveScheduling.ROUND_ROBIN):
+            self._compile_loop_generator_based(loop, batch_size, rounds)
+            return
+
+        wave_size = loop.wave_size
+        scheduler_type = loop.scheduler_type
+
+        self.skip_indices_mode = skip_indices
+
+        # Initialize smart scheduler if using time-based scheduling
+        if scheduler_type == SchedulerType.TIME_BASED:
+            self._smart_scheduler = SmartScheduler(SLOT_LIMITS)
+            self._batch_times = {}
+
+        # Calculate waves
+        total_batches = batch_size // chunk_size
+        n_waves = (total_batches + wave_size - 1) // wave_size
+
+        for wave_idx in range(n_waves):
+            wave_start = wave_idx * wave_size
+            wave_end = min(wave_start + wave_size, total_batches)
+            current_wave_size = wave_end - wave_start
+
+            # For this wave, process in chunk groups
+            wave_chunks_per_round = current_wave_size // n_chunks
+            if wave_chunks_per_round == 0:
+                wave_chunks_per_round = 1
+
+            # Process all rounds for this wave
+            for cg in range(wave_chunks_per_round):
+                # Calculate batch indices for this chunk group in this wave
+                batch_indices = []
+                for c in range(min(n_chunks, current_wave_size - cg * n_chunks)):
+                    batch_idx = wave_start + cg * n_chunks + c
+                    batch_indices.append(batch_idx * chunk_size)
+
+                if not batch_indices:
+                    continue
+
+                tile_chunk_scratch = chunk_scratch[:len(batch_indices)]
+
+                # Initialize indices to 0 for this chunk group
+                if skip_indices:
+                    for c, (p_idx, _, _, _, _, _) in enumerate(tile_chunk_scratch):
+                        self.emit("valu", ("vbroadcast", p_idx, self.get_const(0)))
+                    self.flush_schedule()
+
+                # Process all rounds for this chunk group
+                for r in range(rounds):
+                    self.current_round = r
+
+                    if scheduler_type == SchedulerType.WAVE_INTERLEAVED:
+                        # Interleave operations across all batches in the wave
+                        self._compile_phases_wave_interleaved(
+                            loop.body, tile_chunk_scratch, batch_indices, loop,
+                            skip_indices=skip_indices
+                        )
+                    else:
+                        # Use time-based scheduling
+                        self._compile_phases(loop.body, tile_chunk_scratch, batch_indices, loop,
+                                           skip_indices=skip_indices)
+
+        # If using smart scheduler, emit accumulated instructions
+        if scheduler_type == SchedulerType.TIME_BASED and self._smart_scheduler:
+            self.instrs.extend(self._smart_scheduler.get_instrs())
+            self._smart_scheduler = None
+
+    def _compile_phases_wave_interleaved(self, seq: PhaseSequenceNode, chunk_scratch,
+                                          batch_indices, loop: LoopNode, skip_indices: bool = False):
+        """Compile phases with wave-interleaved scheduling.
+
+        Emits operations from all batches together, allowing the scheduler
+        to pack them more efficiently.
+        """
+        interleave = loop.interleave
+        memory = loop.memory
+
+        # Phase 1: Load indices and values for ALL chunks
+        for c, (p_idx, p_val, _, _, _, p_addrs) in enumerate(chunk_scratch):
+            if len(batch_indices) <= c:
+                continue
+            if skip_indices:
+                self.emit("load", ("const", p_addrs[1], batch_indices[c]))
+            else:
+                self.emit("load", ("const", p_addrs[0], batch_indices[c]))
+                self.emit("load", ("const", p_addrs[1], batch_indices[c]))
+
+        for c, (p_idx, p_val, _, _, _, p_addrs) in enumerate(chunk_scratch):
+            if len(batch_indices) <= c:
+                continue
+            if skip_indices:
+                self.emit("alu", ("+", p_addrs[1], self.scratch["inp_values_p"], p_addrs[1]))
+            else:
+                self.emit("alu", ("+", p_addrs[0], self.scratch["inp_indices_p"], p_addrs[0]))
+                self.emit("alu", ("+", p_addrs[1], self.scratch["inp_values_p"], p_addrs[1]))
+        self.flush_schedule()
+
+        for c, (p_idx, p_val, _, _, _, p_addrs) in enumerate(chunk_scratch):
+            if len(batch_indices) <= c:
+                continue
+            if not skip_indices:
+                self.emit("load", ("vload", p_idx, p_addrs[0]))
+            self.emit("load", ("vload", p_val, p_addrs[1]))
+        self.flush_schedule()
+
+        # Phase 2: Gather all node values (interleaved across chunks)
+        self._compile_gather(seq.gather, chunk_scratch[:len(batch_indices)], interleave, memory)
+
+        # XOR values with gathered node values
+        for c, (p_idx, p_val, p_node_val, _, _, _) in enumerate(chunk_scratch[:len(batch_indices)]):
+            self.emit("valu", ("^", p_val, p_val, p_node_val), "hash")
+        # Don't flush yet - let hash operations interleave
+
+        # Phase 3: Hash (all chunks interleaved)
+        self._compile_hash(seq.hash_comp, chunk_scratch[:len(batch_indices)], interleave, seq)
+
+        # Phase 4: Index computation (all chunks)
+        self._compile_index(seq.index_comp, chunk_scratch[:len(batch_indices)], interleave)
+
+        # Phase 5: Store results
+        self._compile_store(seq.store, chunk_scratch[:len(batch_indices)], batch_indices, interleave, memory)
+
+        if self.interleave_buffer:
+            self.flush_interleaved(interleave)
+
+    def _compile_loop_generator_based(self, loop: LoopNode, batch_size: int, rounds: int):
+        """Generator-based wave execution with round-robin scheduling.
+
+        Uses generators to yield operation batches per logical step, then
+        interleaves operations across batches using round-robin consumption.
+        This naturally achieves high ILP by mixing operations from different batches.
+
+        Key features:
+        - Bulk load all data upfront into segmented scratch regions
+        - Fixed 32-register layout per batch for predictable allocation
+        - Round-robin generator consumption for natural interleaving
+        - Scalar loads for scatter-gather (non-contiguous addresses)
+        """
+        wave_size = loop.wave_size
+
+        # Generator-specific memory layout to avoid conflicts:
+        # HEADER region (0-63): scalar pointers and constants
+        # IDX region (64-319): input indices
+        # VAL region (320-575): input values
+        # CACHE region (576-831): vector constants
+        # TMP region (832-1535): batch temporaries
+        GEN_IDX_BASE = 64
+        GEN_VAL_BASE = 320
+        GEN_CACHE_BASE = 576
+        GEN_TMP_BASE = 832
+
+        # Initialize smart scheduler
+        scheduler = SmartScheduler(SLOT_LIMITS)
+        batch_times: Dict[int, int] = {}  # batch_id -> time available
+
+        # Prologue: Load pointers from memory header
+        tmp = self.alloc_scratch("gen_tmp")
+        inp_indices_p = self.alloc_scratch("gen_inp_indices_p")
+        inp_values_p = self.alloc_scratch("gen_inp_values_p")
+        forest_values_p = self.alloc_scratch("gen_forest_values_p")
+        n_nodes_addr = self.alloc_scratch("gen_n_nodes")
+
+        # Load header values
+        self.emit("load", ("const", tmp, 5))
+        self.flush_schedule()
+        self.emit("load", ("load", inp_indices_p, tmp))
+        self.flush_schedule()
+        self.emit("load", ("const", tmp, 6))
+        self.flush_schedule()
+        self.emit("load", ("load", inp_values_p, tmp))
+        self.flush_schedule()
+        self.emit("load", ("const", tmp, 4))
+        self.flush_schedule()
+        self.emit("load", ("load", forest_values_p, tmp))
+        self.flush_schedule()
+        self.emit("load", ("const", tmp, 1))
+        self.flush_schedule()
+        self.emit("load", ("load", n_nodes_addr, tmp))
+        self.flush_schedule()
+
+        # Allocate vector constants in CACHE region
+        self.scratch_ptr = GEN_CACHE_BASE
+
+        # Broadcast n_nodes to vector
+        n_nodes_vec = self.alloc_scratch("gen_n_nodes_vec", VLEN)
+        self.emit("valu", ("vbroadcast", n_nodes_vec, n_nodes_addr))
+
+        # Vector constants
+        zero_vec = self.alloc_scratch("gen_zero_vec", VLEN)
+        one_vec = self.alloc_scratch("gen_one_vec", VLEN)
+        two_vec = self.alloc_scratch("gen_two_vec", VLEN)
+        self.emit("valu", ("vbroadcast", zero_vec, self.get_const(0)))
+        self.emit("valu", ("vbroadcast", one_vec, self.get_const(1)))
+        self.emit("valu", ("vbroadcast", two_vec, self.get_const(2)))
+
+        # Hash constant vectors
+        hash_const_vecs = []
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            c1 = self.alloc_scratch(f"gen_h{hi}_c1", VLEN)
+            c3 = self.alloc_scratch(f"gen_h{hi}_c3", VLEN)
+            self.emit("valu", ("vbroadcast", c1, self.get_const(val1)))
+            self.emit("valu", ("vbroadcast", c3, self.get_const(val3)))
+            hash_const_vecs.append((c1, c3))
+        self.flush_schedule()
+
+        # Bulk load values into VAL_BASE (always needed)
+        # For indices: if skip_indices, initialize to 0; otherwise load from memory
+        skip_indices = loop.skip_indices and loop.loop_order == "chunk_first"
+
+        if skip_indices:
+            # Initialize all indices to 0 (start at root of tree)
+            for b in range(0, batch_size, VLEN):
+                self.emit("valu", ("vbroadcast", GEN_IDX_BASE + b, self.get_const(0)))
+            self.flush_schedule()
+        else:
+            # Load indices from memory
+            for b in range(0, batch_size, VLEN):
+                b_const = self.get_const(b)
+                addr_tmp = self.alloc_scratch(f"gen_addr_{b}")
+                self.emit("alu", ("+", addr_tmp, inp_indices_p, b_const))
+            self.flush_schedule()
+
+            for b in range(0, batch_size, VLEN):
+                addr_tmp = self.scratch.get(f"gen_addr_{b}")
+                if addr_tmp:
+                    self.emit("load", ("vload", GEN_IDX_BASE + b, addr_tmp))
+            self.flush_schedule()
+
+        # Load values from memory
+        for b in range(0, batch_size, VLEN):
+            b_const = self.get_const(b)
+            addr_tmp = self.alloc_scratch(f"gen_vaddr_{b}")
+            self.emit("alu", ("+", addr_tmp, inp_values_p, b_const))
+        self.flush_schedule()
+
+        for b in range(0, batch_size, VLEN):
+            addr_tmp = self.scratch.get(f"gen_vaddr_{b}")
+            if addr_tmp:
+                self.emit("load", ("vload", GEN_VAL_BASE + b, addr_tmp))
+        self.flush_schedule()
+
+        # Reset scratch pointer to TMP_BASE for batch temporaries
+        self.scratch_ptr = GEN_TMP_BASE
+
+        # Process in waves
+        total_batches = batch_size // VLEN
+        n_waves = (total_batches + wave_size - 1) // wave_size
+
+        for wave_idx in range(n_waves):
+            wave_start = wave_idx * wave_size
+            wave_end = min(wave_start + wave_size, total_batches)
+            current_wave_batches = wave_end - wave_start
+
+            # Create generators for each batch in this wave
+            wave_generators = []
+            for b_idx in range(current_wave_batches):
+                batch_offset = (wave_start + b_idx) * VLEN
+
+                # Fixed 32-reg layout per batch (reused across waves)
+                if loop.batch_reg_layout == BatchRegisterLayout.FIXED_32:
+                    t_base = GEN_TMP_BASE + (b_idx * 32)
+                else:
+                    t_base = GEN_TMP_BASE + (b_idx * 32)  # Default to fixed anyway
+
+                gen = self._gen_batch_all_rounds(
+                    batch_offset, rounds, hash_const_vecs,
+                    forest_values_p, two_vec, zero_vec, one_vec, n_nodes_vec,
+                    t_base, loop.gather_load_mode,
+                    GEN_IDX_BASE, GEN_VAL_BASE
+                )
+                wave_generators.append((b_idx, gen))
+                # Only initialize batch_times for first wave (wave 0)
+                # Subsequent waves reuse the same temp registers, so they must wait
+                # until the previous wave's corresponding batch has finished
+                if wave_idx == 0:
+                    batch_times[b_idx] = 0
+                # Otherwise keep existing batch_times[b_idx] from previous wave
+
+            # Round-robin consumption of generators
+            has_work = True
+            while has_work:
+                has_work = False
+                for tid, gen in wave_generators:
+                    try:
+                        op_list = next(gen)
+                        has_work = True
+
+                        start_time = batch_times[tid]
+                        max_t = start_time
+
+                        for op in op_list:
+                            t = scheduler.schedule(op, start_time)
+                            max_t = max(max_t, t + op.latency)
+
+                        batch_times[tid] = max_t
+
+                    except StopIteration:
+                        pass
+
+        # Emit scheduled instructions
+        self.instrs.extend(scheduler.get_instrs())
+
+        # Epilogue: Store results back
+        # Always store indices at the end (skip_indices only affects intermediate loads/stores)
+        for b in range(0, batch_size, VLEN):
+            b_const = self.get_const(b)
+            addr_tmp = self.alloc_scratch(f"gen_store_idx_{b}")
+            self.emit("alu", ("+", addr_tmp, inp_indices_p, b_const))
+        self.flush_schedule()
+
+        for b in range(0, batch_size, VLEN):
+            addr_tmp = self.scratch.get(f"gen_store_idx_{b}")
+            if addr_tmp:
+                self.emit("store", ("vstore", addr_tmp, GEN_IDX_BASE + b))
+        self.flush_schedule()
+
+        # Always store values
+        for b in range(0, batch_size, VLEN):
+            b_const = self.get_const(b)
+            addr_tmp = self.alloc_scratch(f"gen_store_val_{b}")
+            self.emit("alu", ("+", addr_tmp, inp_values_p, b_const))
+        self.flush_schedule()
+
+        for b in range(0, batch_size, VLEN):
+            addr_tmp = self.scratch.get(f"gen_store_val_{b}")
+            if addr_tmp:
+                self.emit("store", ("vstore", addr_tmp, GEN_VAL_BASE + b))
+        self.flush_schedule()
+
+    def _gen_batch_all_rounds(self, b_off: int, rounds: int, hash_consts,
+                               forest_base: int, two_vec: int, zero_vec: int,
+                               one_vec: int, n_nodes_vec: int, t_base: int,
+                               gather_load_mode: GatherLoadMode,
+                               idx_base: int, val_base: int):
+        """Generator that yields operation batches for one batch through all rounds.
+
+        Fixed 32-register layout per batch:
+        - T_NODE_VEC = t_base + 0  (8 regs) - gathered node values
+        - T_ADDR_VEC = t_base + 8  (8 regs) - address registers
+        - T_TMP1 = t_base + 16     (8 regs) - temporary 1
+        - T_TMP2 = t_base + 24     (8 regs) - temporary 2
+        """
+        T_NODE_VEC = t_base
+        T_ADDR_VEC = t_base + 8
+        T_TMP1 = t_base + 16
+        T_TMP2 = t_base + 24
+
+        idx_vec = idx_base + b_off
+        val_vec = val_base + b_off
+
+        for r in range(rounds):
+            # Step 1: Address calculation for gather
+            ops = []
+            for i in range(VLEN):
+                ops.append(Op("alu", ("+", T_ADDR_VEC + i, forest_base, idx_vec + i)))
+            yield ops
+
+            # Step 2: Load node values (scatter-gather)
+            ops = []
+            if gather_load_mode == GatherLoadMode.SCALAR_LOAD:
+                # Individual scalar loads for non-contiguous addresses
+                for i in range(VLEN):
+                    ops.append(Op("load", ("load", T_NODE_VEC + i, T_ADDR_VEC + i)))
+            else:
+                # Vector load (only works if addresses are contiguous)
+                ops.append(Op("load", ("vload", T_NODE_VEC, T_ADDR_VEC)))
+            yield ops
+
+            # Step 3: XOR values with node values
+            yield [Op("valu", ("^", val_vec, val_vec, T_NODE_VEC))]
+
+            # Step 4: Hash computation (6 stages)
+            for hi, (c1, c3) in enumerate(hash_consts):
+                op1, _, op2, op3, _ = HASH_STAGES[hi]
+                yield [Op("valu", (op1, T_TMP1, val_vec, c1))]
+                yield [Op("valu", (op3, T_TMP2, val_vec, c3))]
+                yield [Op("valu", (op2, val_vec, T_TMP1, T_TMP2))]
+
+            # Step 5: Index update
+            # idx = 2*idx + (1 if val % 2 == 0 else 2)
+            yield [Op("valu", ("%", T_TMP1, val_vec, two_vec))]
+            yield [Op("valu", ("==", T_TMP1, T_TMP1, zero_vec))]
+            yield [Op("flow", ("vselect", T_TMP2, T_TMP1, one_vec, two_vec))]
+            yield [Op("valu", ("*", idx_vec, idx_vec, two_vec))]
+            yield [Op("valu", ("+", idx_vec, idx_vec, T_TMP2))]
+
+            # Step 6: Bounds check - wrap to 0 if >= n_nodes
+            yield [Op("valu", ("<", T_TMP1, idx_vec, n_nodes_vec))]
+            yield [Op("flow", ("vselect", idx_vec, T_TMP1, idx_vec, zero_vec))]
 
     def _compile_loop_pipelined(self, loop: LoopNode, chunk_scratch, chunks_per_round: int,
                                 rounds: int, outer_unroll: int, skip_indices: bool,
@@ -3216,6 +3848,7 @@ class GeneticProgrammingV3:
             print(f"  Interleave: {loop.interleave.strategy.value}")
             print(f"  Pipeline: enabled={loop.pipeline.enabled}, depth={loop.pipeline.pipeline_depth}")
             print(f"  Memory: prefetch={loop.memory.prefetch_distance}, addr_gen={loop.memory.address_gen.value}")
+            print(f"  Wave: size={loop.wave_size}, scheduler={loop.scheduler_type.value}, layout={loop.memory_layout.value}")
 
         return self.best_program, self.best_fitness
 
@@ -3249,7 +3882,17 @@ class GeneticProgrammingV3:
                     'pipeline': serialize_node(node.pipeline),
                     'interleave': serialize_node(node.interleave),
                     'memory': serialize_node(node.memory),
-                    'registers': serialize_node(node.registers)
+                    'registers': serialize_node(node.registers),
+                    # Extension 7: Smart scheduling
+                    'wave_size': node.wave_size,
+                    'scheduler_type': node.scheduler_type.value,
+                    'memory_layout': node.memory_layout.value,
+                    'bulk_load': node.bulk_load,
+                    # Extension 8: Generator-based emission
+                    'generator_emission': node.generator_emission.value,
+                    'gather_load_mode': node.gather_load_mode.value,
+                    'batch_reg_layout': node.batch_reg_layout.value,
+                    'wave_scheduling': node.wave_scheduling.value
                 }
             elif isinstance(node, PipelineNode):
                 return {
