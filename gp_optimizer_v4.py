@@ -963,24 +963,20 @@ def point_mutation(tree: ProgramNode, rate: float = 0.2) -> ProgramNode:
                 node.tree_cache_depth = random.choice([0, 1, 2, 3])
 
         elif isinstance(node, LoopNode):
-            choice = random.randint(0, 5)
+            # FORCED: Keep loop_order=chunk_first and skip_indices=True
+            # Only mutate other parameters
+            choice = random.randint(0, 3)
             if choice == 0:
                 node.structure = random.choice(list(LoopStructure))
             elif choice == 1:
-                node.parallel_chunks = random.choice([4, 8, 16, 32])
+                node.parallel_chunks = random.choice([8, 16, 32])
             elif choice == 2:
                 node.outer_unroll = random.choice([1, 2])
-            elif choice == 3:
-                node.chunk_unroll = random.choice([1, 2])
-            elif choice == 4:
-                node.loop_order = random.choice(["round_first", "chunk_first"])
-                # Validate: skip_indices requires chunk_first
-                if node.loop_order == "round_first":
-                    node.skip_indices = False
             else:
-                # Only allow skip_indices=True if loop_order is chunk_first
-                if node.loop_order == "chunk_first":
-                    node.skip_indices = not node.skip_indices
+                node.chunk_unroll = random.choice([1, 2])
+            # Ensure skip_indices stays enabled
+            node.loop_order = "chunk_first"
+            node.skip_indices = True
 
         elif isinstance(node, PipelineNode):
             choice = random.randint(0, 3)
