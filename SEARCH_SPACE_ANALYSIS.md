@@ -1,239 +1,304 @@
 # GP Search Space Analysis
 
-## Current Constraints in GP V3
+*Last updated: January 2026 - Based on empirical testing of each parameter*
 
-### 1. Hard-Coded Numeric Ranges
+## Parameter Status Summary
 
-| Parameter | Current Range | Could Be |
-|-----------|---------------|----------|
-| `parallel_chunks` | [4, 8, 16] | [2, 4, 8, 16, 32] |
-| `pipeline_depth` | [1, 2, 3] | [1, 2, 3, 4] |
-| `outer_unroll` | [1, 2] | [1, 2, 4, 8] |
-| `chunk_unroll` | [1, 2] | [1, 2, 4] |
-| `inner_unroll` | [1, 2, 4] | [1, 2, 4, 8] |
-| `vector_grouping` | [1, 2] | [1, 2, 4] |
-| `addr_compute_ahead` | [0, 1, 2] | [0, 1, 2, 4, 8] |
-| `stage_unroll` | each [1, 2] | each [1, 2, 4] |
-| `compute_unroll` | [1, 2] | [1, 2, 4] |
-| `batch_stores` | [1, 2] | [1, 2, 4] |
-| `prefetch_distance` | [0, 1, 2] | [0, 1, 2, 4, 8] |
-| `store_buffer_depth` | [0, 1, 2] | [0, 1, 2, 4] |
-| `lookahead_depth` | [1, 2, 3, 4] | [1, 2, 4, 8] |
-| `min_slot_fill` | [0.3, 0.5, 0.7] | [0.1, 0.3, 0.5, 0.7, 0.9] |
-| `spill_threshold` | [256, 512, 768] | [128, 256, 512, 768, 1024] |
-| `vector_alignment` | [8, 16] | [8, 16, 32] |
-| `reserve_temps` | [2, 4, 8] | [0, 2, 4, 8, 16] |
-
-### 2. Dead Parameters (Declared but Not Implemented)
-
-| Node | Unused Parameters | Impact |
-|------|-------------------|--------|
-| **PipelineNode** | `enabled`, `pipeline_depth`, `schedule`, `prologue_unroll`, `epilogue_drain` | No software pipelining of loop iterations |
-| **InterleaveNode** | `strategy`, `lookahead_depth`, `min_slot_fill`, `allow_cross_chunk` | No cross-phase instruction mixing |
-| **RegisterNode** | `allocation`, `reuse_policy`, `spill_threshold`, `vector_alignment`, `reserve_temps` | Fixed sequential register allocation |
-| **MemoryNode** | `store_buffer_depth`, `coalesce_loads`, `coalesce_stores` | No store buffering or coalescing |
-| **GatherNode** | `inner_unroll`, `vector_grouping`, `addr_compute_ahead` | Fixed gather loop structure |
-| **HashNode** | `stage_unroll`, `cross_chunk_interleave` | Fixed hash stage structure |
-| **IndexNode** | `compute_unroll`, `speculative` | Fixed index computation |
-| **StoreNode** | `batch_stores`, `write_combining` | Fixed store pattern |
-| **PhaseSequenceNode** | `fused_phases` list | Only GATHER_XOR fusion works |
-
-### 3. Structural Constraints
-
-**Phase Order:**
-- Only 2 orderings allowed:
-  - `[gather, hash, index, store]`
-  - `[gather, index, hash, store]`
-- Could have 24 permutations (4!)
-- Could allow phases to be skipped or repeated
-
-**Tree Structure:**
-- Fixed depth: Program → Setup + Loop → PhaseSequence → Phases
-- No nested loops (V2 had `inner_loop`, V3 removed it)
-- Single loop structure per program
-- Can't represent shared computation between phases
+### Legend
+- **LIVE**: Parameter affects generated code (verified by instruction count changes)
+- **DEAD**: Parameter declared but never read in code generation
+- **CONDITIONAL**: Only affects code under specific conditions
 
 ---
 
-## Hidden Constraints (Structural Assumptions)
+## 1. LIVE Parameters (Actually Work)
 
-### 4. Fixed Instruction Sequences
+### GatherNode
 
-Each phase always generates the same *pattern* of instructions. We pick strategies but the actual ALU/VALU sequences are hardcoded.
+| Parameter | Values | Status | Notes |
+|-----------|--------|--------|-------|
+| `strategy` | SEQUENTIAL, DUAL_ADDR, BATCH_ADDR, PIPELINED, VECTORIZED | LIVE | BATCH_ADDR saves ~256 instrs vs SEQUENTIAL |
+| `flush_after_addr` | bool | LIVE | False saves ~256 instrs |
+| `inner_unroll` | [1, 2, 4] | LIVE | 1→2 saves ~256 instrs; 2→4 no change unless max_addr_regs=4 |
+| `max_addr_regs` | [2, 4] | CONDITIONAL | Only matters when inner_unroll > 2; saves ~128 instrs with unroll=4 |
 
-**Example - Hash always does:**
-```
-op1(val, const1) → tmp1
-op3(val, const3) → tmp2
-flush
-op2(tmp1, tmp2) → val
-```
+### HashNode
 
-**Never explores:**
-- `op1 → op2 → op3` ordering
-- Fusing operations differently
-- Different temporary register assignments
+| Parameter | Values | Status | Notes |
+|-----------|--------|--------|-------|
+| `flush_per_stage` | bool | LIVE | Adds flush between hash stages |
+| `use_preloaded_consts` | bool | LIVE | False adds inline vbroadcast ops |
+| `fuse_xor_with_stage1` | bool | CONDITIONAL | Only works when fusion_mode=GATHER_XOR |
+| `stage_unroll` | tuple[int, ...] | LIVE | Controls flush granularity between stages |
+| `cross_chunk_interleave` | bool | LIVE | Interleaves ops across chunks for better ILP |
 
-### 5. Greedy Scheduling
+### IndexNode
 
-The scheduler packs bundles greedily by dependency order.
+| Parameter | Values | Status | Notes |
+|-----------|--------|--------|-------|
+| `strategy` | VSELECT, ARITHMETIC, MULTIPLY_ADD, BRANCHLESS | LIVE | MULTIPLY_ADD typically best (~500 cycle difference) |
+| `use_preloaded_consts` | bool | LIVE | True saves ~384 cycles |
+| `speculative` | bool | LIVE | Computes both branches, uses vselect |
 
-**Never explores:**
-- Deliberately leaving slots empty to reduce register pressure
-- Different tie-breaking heuristics when multiple ops are ready
-- Scheduling for cache locality vs ILP tradeoffs
+### StoreNode
 
-### 6. Fixed Computation (Algorithmic)
+| Parameter | Values | Status | Notes |
+|-----------|--------|--------|-------|
+| `flush_after_addr` | bool | LIVE | False saves ~384 cycles |
+| `write_combining` | bool | LIVE | Adds flushes after store batches |
+| `batch_stores` | [1, 2, 4, 8] | CONDITIONAL | Only affects code when write_combining=True |
+| `store_order` | idx_first, val_first, interleaved | CONDITIONAL | Only matters with write_combining + batch_stores>=2 |
 
-**Hash algorithm is immutable:**
-- 4 stages with fixed operations
-- `HASH_STAGES` constant from problem.py
-- Could there be mathematically equivalent but faster formulations?
+### MemoryNode
 
-**Index formula is fixed:**
-```python
-idx = idx * 2 + (2 - (val % 2 == 0))
-```
+| Parameter | Values | Status | Notes |
+|-----------|--------|--------|-------|
+| `access_order` | SEQUENTIAL, STRIDED, BLOCKED, REVERSED | LIVE | Changes gather element processing order |
+| `coalesce_loads` | bool | LIVE | Groups all loads together before flush |
 
-**Algebraic equivalences not explored:**
-- `x * 2` could be `x + x` or `x << 1`
-- `x % 2` could be `x & 1`
-- `2 - condition` could be `1 + (1 - condition)`
+### LoopNode
 
-### 7. Single Loop Nest
+| Parameter | Values | Status | Notes |
+|-----------|--------|--------|-------|
+| `parallel_chunks` | [4, 8, 16] | LIVE | All produce different instruction counts |
+| `loop_order` | chunk_first, round_first | LIVE | Different iteration patterns |
+| `skip_indices` | bool | CONDITIONAL | Only works with loop_order=chunk_first |
 
-**Always:**
-```
-for round in rounds:
-    for chunk_group in chunks_per_round:
-        process(chunk_group)
-```
+### SetupNode
 
-**Never explores:**
-- Loop tiling: `for round_tile: for chunk_tile: for r in tile: for c in tile`
-- Loop peeling for first/last iterations
-- Loop versioning for special cases
-- Duff's device style unrolling
+| Parameter | Values | Status | Notes |
+|-----------|--------|--------|-------|
+| `preload_scalars` | bool | LIVE | Preloads common scalar constants |
+| `preload_vectors` | bool | LIVE | Preloads vector constants (0, 1, 2) |
+| `preload_hash_consts` | bool | LIVE | Preloads hash stage constants |
 
-### 8. Fixed Data Flow
+### PhaseSequenceNode
 
-**Always:**
-```
-load → gather → xor → hash → index → store
-```
-
-**Never explores:**
-- Computing indices speculatively while gathering
-- Overlapping round N's store with round N+1's gather
-- Splitting phases (half gather, half hash, other half gather, other half hash)
-- Out-of-order phase execution based on data availability
-
-### 9. Bundle Boundaries = Cycle Boundaries
-
-We assume `flush_schedule()` = cycle boundary.
-
-**Could explore:**
-- "Soft" flushes that hint but don't force
-- Partial flushes (only some engines)
-- Speculative execution past flush points
-
-### 10. Fixed Vector Width Usage
-
-**Always process full VLEN=8 vectors.**
-
-**Never explores:**
-- Processing 4 elements at a time with 2x unroll
-- Mixed scalar/vector execution
-- Partial vector operations for edge cases
-
-### 11. No Instruction Substitution
-
-`multiply_add` vs separate `mul` + `add` is a strategy choice, but many other substitutions exist:
-
-| Operation | Alternatives |
-|-----------|-------------|
-| `x * 2` | `x + x`, `x << 1` |
-| `x % 2` | `x & 1` |
-| `x == 0` | `!x`, `x < 1` |
-| `x * y + z` | `multiply_add(x, y, z)` |
-| `a ? b : c` | `select`, `b * a + c * (1-a)` |
-
-### 12. The GP Tree Structure Itself
-
-Tree structure forces hierarchical decomposition.
-
-**Cannot represent:**
-- Shared computation between phases
-- Instruction-level dataflow graphs (like CGP would)
-- Feedback loops / iteration-carried dependencies
-- Dynamic control flow
+| Parameter | Values | Status | Notes |
+|-----------|--------|--------|-------|
+| `phase_order` | [gather,hash,index,store] or [gather,index,hash,store] | LIVE | Only 2 orderings implemented |
+| `fusion_mode` | NONE, GATHER_XOR, ... | LIVE | Only GATHER_XOR actually implemented |
 
 ---
 
-## Expansion Opportunities
+## 2. DEAD Parameters (15 Total)
 
-### High Impact
+### GatherNode (3 dead)
 
-1. **Linear GP (LGP) Layer**
-   - Evolve actual instruction sequences within phases
-   - Much larger search space but could find novel optimizations
+| Parameter | Why Dead |
+|-----------|----------|
+| `flush_per_element` | Declared but never read in `_compile_gather()` |
+| `vector_grouping` | Declared but never read in `_compile_gather()` |
+| `addr_compute_ahead` | Declared but never read in `_compile_gather()` |
 
-2. **Algebraic Equivalence Exploration**
-   - Let GP discover `x & 1` == `x % 2`
-   - Strength reduction: `x * 2` → `x << 1`
+### HashNode (1 dead)
 
-3. **Cross-Phase Data Flow**
-   - Break strict phase boundaries
-   - Overlap independent operations from different phases
+| Parameter | Why Dead |
+|-----------|----------|
+| `strategy` | The enum (STANDARD, FUSED, INTERLEAVED, UNROLLED) is **never checked** in `_compile_hash()` - all paths use same logic |
 
-4. **Scheduling Exploration**
-   - Evolve the scheduler heuristics, not just the code
-   - Multiple scheduling strategies as GP choices
+### IndexNode (2 dead)
+
+| Parameter | Why Dead |
+|-----------|----------|
+| `flush_per_op` | Declared but never read |
+| `compute_unroll` | Declared but never read |
+
+### MemoryNode (4 dead)
+
+| Parameter | Why Dead |
+|-----------|----------|
+| `address_gen` | EAGER/LAZY/SPECULATIVE enum never checked |
+| `prefetch_distance` | Declared but never read |
+| `store_buffer_depth` | Read but doesn't change behavior (flush logic ineffective) |
+| `coalesce_stores` | Read but overridden - only affects `effective_store_order` which itself is often dead |
+
+### LoopNode (2 dead)
+
+| Parameter | Why Dead |
+|-----------|----------|
+| `structure` | Only CHUNKED path implemented in `_compile_loop()` |
+| `outer_unroll` | Declared but never affects code generation |
+
+### PipelineNode (entire node dead)
+
+| Parameter | Why Dead |
+|-----------|----------|
+| `enabled` | Never checked - no software pipelining implemented |
+| `stages` | Never read |
+| `initiation_interval` | Never read |
+| `pipeline_depth` | Never read |
+| `schedule` | Never read |
+
+### InterleaveNode (2 dead)
+
+| Parameter | Why Dead |
+|-----------|----------|
+| `lookahead_depth` | Never read in scheduling logic |
+| `min_slot_fill` | Never read in scheduling logic |
+| `strategy` | Enum exists but only basic buffering works, no true interleaving |
+
+### RegisterNode (entire node dead)
+
+| Parameter | Why Dead |
+|-----------|----------|
+| `allocation` | Never read - uses fixed sequential allocation |
+| `reuse_policy` | Never read |
+| `spill_threshold` | Never read |
+| `vector_alignment` | Never read |
+| `reserve_temps` | Never read |
+| `max_live_vectors` | Never read |
+
+### SetupNode (1 dead)
+
+| Parameter | Why Dead |
+|-----------|----------|
+| `init_scratch` | Declared but never read |
+
+---
+
+## 3. Parameter Value Ranges
+
+### Current vs Potential Expansion
+
+| Parameter | Current | Could Be | Constraint |
+|-----------|---------|----------|------------|
+| `parallel_chunks` | [4, 8, 16] | [4, 8, 16, 32] | 32 chunks uses 90% of scratch memory |
+| `inner_unroll` | [1, 2, 4] | [1, 2, 4, 8] | 8 = full VLEN, needs max_addr_regs=8 |
+| `max_addr_regs` | [2, 4] | [2, 4, 8] | Limited by scratch space per chunk |
+| `batch_stores` | [1, 2, 4] | [1, 2, 4, 8, 16] | Should match parallel_chunks |
+| `stage_unroll` | each [1, 2] | each [1, 2, 4] | More aggressive unrolling |
+| `outer_unroll` | [1, 2, 4] | Would need implementation | Currently dead |
+
+### Hardware Constraints
+
+```
+VLEN = 8              # Vector length
+SCRATCH_SIZE = 1536   # Total scratch memory (words)
+SLOT_LIMITS = {
+    'alu': 12,        # ALU ops per cycle
+    'valu': 6,        # Vector ops per cycle
+    'load': 2,        # Loads per cycle (main bottleneck)
+    'store': 2,       # Stores per cycle
+    'flow': 1,        # Control ops per cycle
+}
+```
+
+### Scratch Usage Analysis
+
+| Chunks | Addr Regs | Scratch Used | % of 1536 |
+|--------|-----------|--------------|-----------|
+| 8 | 2 | 386 | 25% |
+| 8 | 4 | 402 | 26% |
+| 16 | 2 | 722 | 47% |
+| 16 | 4 | 754 | 49% |
+| 32 | 2 | 1394 | 91% |
+| 32 | 4 | 1458 | 95% |
+
+---
+
+## 4. Effective Search Space
+
+### What's Actually Evolved (Affects Output)
+
+| Category | Options | Count |
+|----------|---------|-------|
+| Loop parallel_chunks | 4, 8, 16 | 3 |
+| Loop loop_order | chunk_first, round_first | 2 |
+| Loop skip_indices | true, false | 2 |
+| Gather strategy | 5 strategies | 5 |
+| Gather flush_after_addr | bool | 2 |
+| Gather inner_unroll | 1, 2, 4 | 3 |
+| Gather max_addr_regs | 2, 4 | 2 |
+| Hash flush_per_stage | bool | 2 |
+| Hash use_preloaded_consts | bool | 2 |
+| Hash fuse_xor_with_stage1 | bool | 2 |
+| Hash stage_unroll | 2^4 combinations | 16 |
+| Hash cross_chunk_interleave | bool | 2 |
+| Index strategy | 4 strategies | 4 |
+| Index use_preloaded_consts | bool | 2 |
+| Index speculative | bool | 2 |
+| Store flush_after_addr | bool | 2 |
+| Store write_combining | bool | 2 |
+| Store batch_stores | 1, 2, 4 | 3 |
+| Store store_order | 3 options | 3 |
+| Memory access_order | 4 options | 4 |
+| Memory coalesce_loads | bool | 2 |
+| Setup preload options | 2^3 | 8 |
+| Phase order | 2 options | 2 |
+| Fusion mode | 2 effective | 2 |
+
+**Estimated unique programs: ~10^9**
+
+### If Dead Parameters Were Implemented
+
+Adding functional implementations of:
+- `outer_unroll` (4 values)
+- `vector_grouping` (3 values)
+- `addr_compute_ahead` (4 values)
+- `HashNode.strategy` (4 values)
+- `store_buffer_depth` (3 values)
+- PipelineNode (multiple params)
+- InterleaveNode (multiple params)
+- RegisterNode (multiple params)
+
+**Estimated unique programs: ~10^15**
+
+---
+
+## 5. Implementation Priority
+
+### High Impact (Should Implement)
+
+1. **`outer_unroll`** - Loop unrolling is a classic optimization
+2. **`HashNode.strategy`** - The enum exists, just needs the switch statement
+3. **`addr_compute_ahead`** - Pipelining address computation with loads
+4. **`vector_grouping`** - Processing multiple vectors together
 
 ### Medium Impact
 
-5. **Full Phase Permutations**
-   - Allow all 24 orderings of 4 phases
-   - Allow phase repetition or skipping
+5. **`store_buffer_depth`** - Delayed store flushing
+6. **Expand `inner_unroll` to 8** - Full vector processing
+7. **Expand `parallel_chunks` to 32** - More parallelism (memory permitting)
 
-6. **Loop Transformations**
-   - Tiling, peeling, versioning as evolvable choices
-   - Nested loop structures
+### Lower Priority (Complex)
 
-7. **Implement Dead Parameters**
-   - Software pipelining
-   - Instruction interleaving
-   - Register allocation strategies
-
-### Lower Impact (but easy)
-
-8. **Expand Numeric Ranges**
-   - Larger unroll factors
-   - More prefetch distances
-   - Wider parallel_chunks range
-
-9. **More Strategies per Phase**
-   - Additional gather/hash/index/store implementations
-   - Hybrid strategies
+8. **PipelineNode** - Requires significant new scheduling logic
+9. **InterleaveNode** - Cross-phase instruction mixing
+10. **RegisterNode** - Register allocation strategies
 
 ---
 
-## Current Effective Search Space
+## 6. Structural Constraints (Not Parameters)
 
-**Actually evolved (affects output):**
-- Loop structure (4 options)
-- parallel_chunks (3 options)
-- Gather strategy (5 options) + flush booleans
-- Hash strategy (4 options) + flush/preload booleans
-- Index strategy (4 options) + flush/preload booleans + bounds_check_mode
-- Store flush + store_order
-- Setup preload booleans
-- Phase order (2 options)
-- Fusion mode (5 options, only 1 implemented)
-- Memory access_order, prefetch_distance
+These are architectural limitations, not individual parameters:
 
-**Rough estimate:** ~10^8 unique programs
+1. **Phase Order** - Only 2 of 24 possible orderings
+2. **Fixed Computation** - Hash algorithm, index formula are immutable
+3. **No Nested Loops** - Single loop structure only
+4. **Greedy Scheduling** - No exploration of scheduling heuristics
+5. **Fixed Vector Width** - Always process full VLEN=8
+6. **No Instruction Substitution** - Can't evolve `x*2` → `x<<1`
 
-**With dead parameters implemented:** ~10^15 unique programs
+---
 
-**With structural expansions (LGP, etc):** ~10^50+ unique programs
+## Appendix: Verification Commands
+
+```bash
+# Test any parameter
+source .venv/bin/activate
+python -c "
+from gp_optimizer_v3 import *
+
+def make_prog(**overrides):
+    # ... create minimal program with overrides
+    pass
+
+# Compare instruction counts
+prog1 = make_prog(param=value1)
+prog2 = make_prog(param=value2)
+i1 = len(GPKernelBuilderV3(prog1).build(10, 1023, 256, 16))
+i2 = len(GPKernelBuilderV3(prog2).build(10, 1023, 256, 16))
+print(f'value1: {i1}, value2: {i2}, delta: {i2-i1}')
+"
+```

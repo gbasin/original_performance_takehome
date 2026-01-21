@@ -1138,10 +1138,42 @@ class GPKernelBuilderV3:
         self.current_round: int = 0
         self.skip_indices_mode: bool = False  # True when all elements start at root
 
+        # Register allocation settings (from RegisterNode)
+        self._reg_settings: Optional[RegisterNode] = None
+        self._alloc_phase: str = ""  # Current phase for PHASED allocation
+        self._phase_bases: dict = {}  # phase -> base address for PHASED
+        self._live_regs: set = set()  # Currently live registers for reuse tracking
+        self._spilled_regs: dict = {}  # reg -> spill address
+        self._temps_reserved: int = 0  # Count of reserved temp registers
+
     def debug_info(self) -> DebugInfo:
         return DebugInfo(scratch_map=self.scratch_debug)
 
     def alloc_scratch(self, name: Optional[str] = None, length: int = 1) -> int:
+        reg = self._reg_settings
+
+        # Apply allocation strategy
+        if reg is not None:
+            if reg.allocation == AllocationStrategy.SPARSE:
+                # SPARSE: Add padding between allocations to reduce conflicts
+                self.scratch_ptr = ((self.scratch_ptr + 3) // 4) * 4  # Align to 4
+            elif reg.allocation == AllocationStrategy.PHASED and self._alloc_phase:
+                # PHASED: Allocate from phase-specific regions
+                phase_region_size = SCRATCH_SIZE // 5  # 5 regions: setup, gather, hash, index, store
+                phase_idx = {"setup": 0, "gather": 1, "hash": 2, "index": 3, "store": 4}.get(self._alloc_phase, 0)
+                phase_base = phase_idx * phase_region_size
+                if self._alloc_phase not in self._phase_bases:
+                    self._phase_bases[self._alloc_phase] = phase_base
+                # Check if we should allocate from phase region
+                if self.scratch_ptr < phase_base:
+                    self.scratch_ptr = phase_base
+
+            # Check spill threshold
+            if reg.spill_threshold > 0 and self.scratch_ptr >= reg.spill_threshold:
+                # Would exceed threshold - could implement spilling here
+                # For now, just warn (spilling would require significant refactoring)
+                pass
+
         addr = self.scratch_ptr
         if name:
             self.scratch[name] = addr
@@ -1151,7 +1183,44 @@ class GPKernelBuilderV3:
         return addr
 
     def alloc_vector(self, name: Optional[str] = None) -> int:
+        reg = self._reg_settings
+
+        # Apply vector alignment from RegisterNode
+        if reg is not None and reg.vector_alignment > VLEN:
+            # Align to specified boundary
+            align = reg.vector_alignment
+            self.scratch_ptr = ((self.scratch_ptr + align - 1) // align) * align
+
+        # Apply reuse_policy from RegisterNode
+        if reg is not None and name is not None:
+            if reg.reuse_policy == ReusePolicy.AGGRESSIVE:
+                # Check if we can reuse a dead register
+                for dead_name, dead_addr in list(self._spilled_regs.items()):
+                    # Reuse immediately
+                    del self._spilled_regs[dead_name]
+                    self.scratch[name] = dead_addr
+                    self.scratch_debug[dead_addr] = (name, VLEN)
+                    return dead_addr
+            elif reg.reuse_policy == ReusePolicy.CONSERVATIVE:
+                # Only reuse if we have multiple dead registers (keep slack)
+                if len(self._spilled_regs) > 2:
+                    dead_name, dead_addr = next(iter(self._spilled_regs.items()))
+                    del self._spilled_regs[dead_name]
+                    self.scratch[name] = dead_addr
+                    self.scratch_debug[dead_addr] = (name, VLEN)
+                    return dead_addr
+            # LIFETIME: would require full liveness analysis - skip for now
+
         return self.alloc_scratch(name, VLEN)
+
+    def mark_dead(self, name: str):
+        """Mark a register as dead (available for reuse)"""
+        if name in self.scratch:
+            self._spilled_regs[name] = self.scratch[name]
+
+    def set_alloc_phase(self, phase: str):
+        """Set current phase for PHASED allocation strategy"""
+        self._alloc_phase = phase
 
     def emit(self, engine: str, slot: tuple, phase: str = ""):
         # Always use pending_slots directly - interleave_buffer is for explicit interleaving
@@ -1294,6 +1363,9 @@ class GPKernelBuilderV3:
 
     def flush_interleaved(self, interleave: InterleaveNode):
         """Flush with interleaving support"""
+        lookahead = interleave.lookahead_depth
+        min_fill = interleave.min_slot_fill
+
         if interleave.strategy == InterleaveStrategy.NONE:
             # No interleaving, just flush normally
             for engine, slot, phase in self.interleave_buffer:
@@ -1307,17 +1379,51 @@ class GPKernelBuilderV3:
         for engine, slot, phase in self.interleave_buffer:
             phase_ops.setdefault(phase, []).append((engine, slot))
 
+        # Calculate slot utilization for min_slot_fill check
+        total_slots = sum(sum(SLOT_LIMITS.values()) for _ in range(lookahead)) if lookahead > 0 else 1
+        current_ops = len(self.interleave_buffer)
+        fill_ratio = current_ops / max(total_slots, 1)
+
+        # If fill ratio is below threshold, accumulate more before flushing
+        # (only if we have lookahead enabled)
+        if lookahead > 1 and fill_ratio < min_fill and current_ops < lookahead * 4:
+            # Don't flush yet - accumulate more operations
+            return
+
         # Interleave phases that can be combined
         if interleave.strategy == InterleaveStrategy.ALL_PHASES:
-            # Mix all phases together
+            # Mix all phases together with lookahead window
             all_ops = [(e, s) for e, s, p in self.interleave_buffer]
-            for e, s in all_ops:
-                self.pending_slots.append((e, s))
+
+            # With lookahead, process in windows to maximize ILP
+            if lookahead > 1:
+                # Group operations by engine type for better packing
+                by_engine = {}
+                for e, s in all_ops:
+                    by_engine.setdefault(e, []).append((e, s))
+
+                # Interleave from different engines up to lookahead depth
+                ops_scheduled = 0
+                while ops_scheduled < len(all_ops):
+                    window_ops = []
+                    for engine_ops in by_engine.values():
+                        window_ops.extend(engine_ops[:lookahead])
+                    for e, s in window_ops[:lookahead * len(by_engine)]:
+                        self.pending_slots.append((e, s))
+                        ops_scheduled += 1
+                    # Remove scheduled ops
+                    for engine in by_engine:
+                        by_engine[engine] = by_engine[engine][lookahead:]
+                    self.flush_schedule()
+            else:
+                for e, s in all_ops:
+                    self.pending_slots.append((e, s))
+                self.flush_schedule()
+
             self.interleave_buffer = []
-            self.flush_schedule()
 
         elif interleave.strategy == InterleaveStrategy.GATHER_HASH:
-            # Interleave gather and hash
+            # Interleave gather and hash with lookahead
             gather_ops = phase_ops.get("gather", [])
             hash_ops = phase_ops.get("hash", [])
             other_ops = []
@@ -1325,22 +1431,95 @@ class GPKernelBuilderV3:
                 if p not in ("gather", "hash"):
                     other_ops.extend(ops)
 
-            # Interleave gather and hash
-            max_len = max(len(gather_ops), len(hash_ops))
-            for i in range(max_len):
-                if i < len(gather_ops):
-                    self.pending_slots.append(gather_ops[i])
-                if i < len(hash_ops):
-                    self.pending_slots.append(hash_ops[i])
-
-            # Flush interleaved
-            self.flush_schedule()
+            # With lookahead, interleave more aggressively
+            if lookahead > 1:
+                g_idx, h_idx = 0, 0
+                while g_idx < len(gather_ops) or h_idx < len(hash_ops):
+                    # Alternate gather and hash in lookahead-sized windows
+                    for _ in range(lookahead):
+                        if g_idx < len(gather_ops):
+                            self.pending_slots.append(gather_ops[g_idx])
+                            g_idx += 1
+                    for _ in range(lookahead):
+                        if h_idx < len(hash_ops):
+                            self.pending_slots.append(hash_ops[h_idx])
+                            h_idx += 1
+                    self.flush_schedule()
+            else:
+                max_len = max(len(gather_ops), len(hash_ops))
+                for i in range(max_len):
+                    if i < len(gather_ops):
+                        self.pending_slots.append(gather_ops[i])
+                    if i < len(hash_ops):
+                        self.pending_slots.append(hash_ops[i])
+                self.flush_schedule()
 
             # Then other phases
             for e, s in other_ops:
                 self.pending_slots.append((e, s))
             self.interleave_buffer = []
             self.flush_schedule()
+
+        elif interleave.strategy == InterleaveStrategy.HASH_INDEX:
+            # Interleave hash and index phases
+            hash_ops = phase_ops.get("hash", [])
+            index_ops = phase_ops.get("index", [])
+            other_ops = []
+            for p, ops in phase_ops.items():
+                if p not in ("hash", "index"):
+                    other_ops.extend(ops)
+
+            # Interleave hash and index
+            max_len = max(len(hash_ops), len(index_ops))
+            for i in range(max_len):
+                if i < len(hash_ops):
+                    self.pending_slots.append(hash_ops[i])
+                if i < len(index_ops):
+                    self.pending_slots.append(index_ops[i])
+
+            self.flush_schedule()
+
+            for e, s in other_ops:
+                self.pending_slots.append((e, s))
+            self.interleave_buffer = []
+            self.flush_schedule()
+
+        elif interleave.strategy == InterleaveStrategy.ADAPTIVE:
+            # Adaptive: choose interleaving based on operation counts
+            # and respect min_slot_fill threshold
+            phase_counts = {p: len(ops) for p, ops in phase_ops.items()}
+
+            # Find phases with most operations - those benefit most from interleaving
+            sorted_phases = sorted(phase_counts.items(), key=lambda x: -x[1])
+
+            if len(sorted_phases) >= 2 and sorted_phases[0][1] > lookahead:
+                # Interleave top two phases
+                p1, p2 = sorted_phases[0][0], sorted_phases[1][0]
+                ops1 = phase_ops.get(p1, [])
+                ops2 = phase_ops.get(p2, [])
+
+                max_len = max(len(ops1), len(ops2))
+                for i in range(max_len):
+                    if i < len(ops1):
+                        self.pending_slots.append(ops1[i])
+                    if i < len(ops2):
+                        self.pending_slots.append(ops2[i])
+                self.flush_schedule()
+
+                # Remaining phases
+                for p, ops in phase_ops.items():
+                    if p not in (p1, p2):
+                        for e, s in ops:
+                            self.pending_slots.append((e, s))
+                self.flush_schedule()
+            else:
+                # Fall back to sequential
+                for phase in ["gather", "hash", "index", "store"]:
+                    for e, s in phase_ops.get(phase, []):
+                        self.pending_slots.append((e, s))
+                self.flush_schedule()
+
+            self.interleave_buffer = []
 
         else:
             # Default: sequential by phase
@@ -1460,6 +1639,16 @@ class GPKernelBuilderV3:
         chunk_size = VLEN
         chunks_per_round = batch_size // (chunk_size * n_chunks)
 
+        # Initialize register allocation settings from RegisterNode
+        self._reg_settings = loop.registers
+        reg = self._reg_settings
+
+        # Reserve temp registers if specified
+        if reg.reserve_temps > 0:
+            self._temps_reserved = reg.reserve_temps
+            for i in range(reg.reserve_temps):
+                self.alloc_scratch(f"reserved_temp_{i}")
+
         # Allocate chunk scratch based on register strategy
         # Number of address registers per chunk is configurable via gather.max_addr_regs
         # Minimum is 2 (needed for idx/val loads in _compile_phases and store)
@@ -1477,10 +1666,53 @@ class GPKernelBuilderV3:
         # Main iteration with optional outer unrolling
         outer_unroll = loop.outer_unroll
 
-        # Validate: skip_indices requires chunk_first
-        skip_indices = loop.skip_indices and loop.loop_order == "chunk_first"
+        # Determine loop structure from explicit structure field or loop_order
+        # LoopStructure takes precedence over loop_order if set to non-default
+        structure = loop.structure
+        use_chunk_first = loop.loop_order == "chunk_first"
 
-        if loop.loop_order == "chunk_first":
+        # Map LoopStructure to behavior
+        if structure == LoopStructure.BATCH_ROUND:
+            use_chunk_first = True  # Process batch across all rounds
+        elif structure == LoopStructure.ROUND_BATCH:
+            use_chunk_first = False  # Process round across all batches
+        elif structure == LoopStructure.CHUNKED:
+            use_chunk_first = True  # Similar to BATCH_ROUND with more granularity
+        # FUSED mode uses special handling below
+
+        # Validate: skip_indices requires chunk_first
+        skip_indices = loop.skip_indices and use_chunk_first
+
+        # Check for software pipelining
+        pipeline = loop.pipeline
+        if pipeline.enabled and pipeline.pipeline_depth > 1:
+            # Software pipelining: overlap loop iterations
+            self._compile_loop_pipelined(loop, chunk_scratch, chunks_per_round, rounds,
+                                        outer_unroll, skip_indices, n_chunks, chunk_size)
+            return
+
+        if structure == LoopStructure.FUSED:
+            # FUSED: Process multiple rounds worth of data with minimal flushing
+            # This maximizes instruction-level parallelism across rounds
+            self.skip_indices_mode = skip_indices
+            for cg in range(0, chunks_per_round, outer_unroll):
+                for u in range(min(outer_unroll, chunks_per_round - cg)):
+                    batch_indices = [(cg + u) * n_chunks * chunk_size + c * chunk_size
+                                    for c in range(n_chunks)]
+
+                    if skip_indices:
+                        for c, (p_idx, _, _, _, _, _) in enumerate(chunk_scratch):
+                            self.emit("valu", ("vbroadcast", p_idx, self.get_const(0)))
+                        self.flush_schedule()
+
+                    # Process all rounds with reduced flushing between phases
+                    for r in range(rounds):
+                        self.current_round = r
+                        # In FUSED mode, we inline phases without full _compile_phases overhead
+                        self._compile_phases_fused(loop.body, chunk_scratch, batch_indices, loop,
+                                                   skip_indices=skip_indices, is_last_round=(r == rounds - 1))
+
+        elif use_chunk_first:
             # CHUNK_FIRST: Process each chunk group through ALL rounds
             # This allows indices to persist in scratch across rounds
             self.skip_indices_mode = skip_indices  # Track for tree cache optimization
@@ -1512,6 +1744,222 @@ class GPKernelBuilderV3:
 
                         self._compile_phases(loop.body, chunk_scratch, batch_indices, loop,
                                            skip_indices=False)
+
+    def _compile_loop_pipelined(self, loop: LoopNode, chunk_scratch, chunks_per_round: int,
+                                rounds: int, outer_unroll: int, skip_indices: bool,
+                                n_chunks: int, chunk_size: int):
+        """Software pipelined loop execution.
+
+        Overlaps iterations to hide latencies. Based on PipelineNode settings:
+        - pipeline_depth: How many iterations are in flight simultaneously
+        - schedule: Which phases to overlap (GATHER_FIRST, BALANCED, STORE_LAST)
+        - prologue_unroll: How many iterations to unroll in prologue
+        - epilogue_drain: Whether to properly drain the pipeline at the end
+        """
+        pipeline = loop.pipeline
+        depth = pipeline.pipeline_depth
+        schedule = pipeline.schedule
+        prologue_unroll = pipeline.prologue_unroll
+        epilogue_drain = pipeline.epilogue_drain
+
+        self.skip_indices_mode = skip_indices
+
+        # Total iterations
+        total_iterations = chunks_per_round * rounds
+
+        # For simplicity, we'll implement pipelining at the chunk group level
+        # Each "iteration" is a chunk group processed through all rounds
+
+        if schedule == PipelineSchedule.GATHER_FIRST:
+            # Start gathers for next iteration while completing current iteration
+            # This is the simplest form of pipelining
+
+            # Prologue: start initial gathers without completing full iterations
+            pending_gathers = []
+            for cg in range(min(depth, chunks_per_round)):
+                batch_indices = [cg * n_chunks * chunk_size + c * chunk_size
+                                for c in range(n_chunks)]
+
+                if skip_indices:
+                    for c, (p_idx, _, _, _, _, _) in enumerate(chunk_scratch):
+                        self.emit("valu", ("vbroadcast", p_idx, self.get_const(0)))
+                    self.flush_schedule()
+
+                # Start gather only (don't complete the full phase)
+                self.current_round = 0
+                self._compile_gather(loop.body.gather, chunk_scratch, loop.interleave, loop.memory)
+                pending_gathers.append((batch_indices, 0))  # (batch_indices, current_round)
+
+            # Steady state: complete iteration while starting next
+            for cg in range(depth, chunks_per_round):
+                # Complete oldest pending iteration
+                if pending_gathers:
+                    old_batch, old_round = pending_gathers.pop(0)
+                    self.current_round = old_round
+                    # Complete remaining phases
+                    self._compile_phases_after_gather(loop.body, chunk_scratch, old_batch, loop,
+                                                     skip_indices=skip_indices)
+
+                    # Process remaining rounds for completed chunk group
+                    for r in range(1, rounds):
+                        self.current_round = r
+                        self._compile_phases(loop.body, chunk_scratch, old_batch, loop,
+                                            skip_indices=skip_indices)
+
+                # Start new iteration's gather
+                batch_indices = [cg * n_chunks * chunk_size + c * chunk_size
+                                for c in range(n_chunks)]
+
+                if skip_indices:
+                    for c, (p_idx, _, _, _, _, _) in enumerate(chunk_scratch):
+                        self.emit("valu", ("vbroadcast", p_idx, self.get_const(0)))
+                    self.flush_schedule()
+
+                self.current_round = 0
+                self._compile_gather(loop.body.gather, chunk_scratch, loop.interleave, loop.memory)
+                pending_gathers.append((batch_indices, 0))
+
+            # Epilogue: drain remaining pending iterations
+            if epilogue_drain:
+                while pending_gathers:
+                    old_batch, old_round = pending_gathers.pop(0)
+                    self.current_round = old_round
+                    self._compile_phases_after_gather(loop.body, chunk_scratch, old_batch, loop,
+                                                     skip_indices=skip_indices)
+                    for r in range(1, rounds):
+                        self.current_round = r
+                        self._compile_phases(loop.body, chunk_scratch, old_batch, loop,
+                                            skip_indices=skip_indices)
+
+        elif schedule == PipelineSchedule.BALANCED:
+            # Interleave all phases across iterations
+            # Process depth iterations in lockstep, one phase at a time
+
+            for cg_base in range(0, chunks_per_round, depth):
+                cg_end = min(cg_base + depth, chunks_per_round)
+                batch_indices_list = []
+
+                for cg in range(cg_base, cg_end):
+                    batch_indices = [cg * n_chunks * chunk_size + c * chunk_size
+                                    for c in range(n_chunks)]
+                    batch_indices_list.append(batch_indices)
+
+                    if skip_indices:
+                        for c, (p_idx, _, _, _, _, _) in enumerate(chunk_scratch):
+                            self.emit("valu", ("vbroadcast", p_idx, self.get_const(0)))
+                self.flush_schedule()
+
+                # Process all rounds
+                for r in range(rounds):
+                    self.current_round = r
+                    # Execute each phase for all iterations in the pipeline
+                    for phase_name in loop.body.phase_order:
+                        for batch_indices in batch_indices_list:
+                            self._compile_single_phase(loop.body, chunk_scratch, batch_indices,
+                                                      loop, phase_name, skip_indices)
+                        self.flush_schedule()
+
+        elif schedule == PipelineSchedule.STORE_LAST:
+            # Delay stores to overlap with next iteration's loads
+            # Buffer store operations and execute them later
+
+            pending_stores = []
+            for cg in range(chunks_per_round):
+                batch_indices = [cg * n_chunks * chunk_size + c * chunk_size
+                                for c in range(n_chunks)]
+
+                if skip_indices:
+                    for c, (p_idx, _, _, _, _, _) in enumerate(chunk_scratch):
+                        self.emit("valu", ("vbroadcast", p_idx, self.get_const(0)))
+                    self.flush_schedule()
+
+                for r in range(rounds):
+                    self.current_round = r
+                    # Execute all but store
+                    for phase_name in loop.body.phase_order:
+                        if phase_name != "store":
+                            self._compile_single_phase(loop.body, chunk_scratch, batch_indices,
+                                                      loop, phase_name, skip_indices)
+                    self.flush_schedule()
+
+                    # Queue store for later
+                    pending_stores.append((batch_indices, r))
+
+                    # Execute queued stores if buffer is full
+                    if len(pending_stores) >= depth:
+                        store_batch, store_round = pending_stores.pop(0)
+                        self.current_round = store_round
+                        self._compile_store(loop.body.store, chunk_scratch, store_batch,
+                                           loop.interleave, loop.memory)
+
+            # Epilogue: drain remaining stores
+            if epilogue_drain:
+                while pending_stores:
+                    store_batch, store_round = pending_stores.pop(0)
+                    self.current_round = store_round
+                    self._compile_store(loop.body.store, chunk_scratch, store_batch,
+                                       loop.interleave, loop.memory)
+
+        else:
+            # NONE or unknown: fall back to regular processing
+            for cg in range(0, chunks_per_round, outer_unroll):
+                for u in range(min(outer_unroll, chunks_per_round - cg)):
+                    batch_indices = [(cg + u) * n_chunks * chunk_size + c * chunk_size
+                                    for c in range(n_chunks)]
+                    if skip_indices:
+                        for c, (p_idx, _, _, _, _, _) in enumerate(chunk_scratch):
+                            self.emit("valu", ("vbroadcast", p_idx, self.get_const(0)))
+                        self.flush_schedule()
+                    for r in range(rounds):
+                        self.current_round = r
+                        self._compile_phases(loop.body, chunk_scratch, batch_indices, loop,
+                                           skip_indices=skip_indices)
+
+    def _compile_phases_after_gather(self, seq: PhaseSequenceNode, chunk_scratch, batch_indices,
+                                     loop: LoopNode, skip_indices: bool = False):
+        """Complete phases after gather has already been done (for pipelining)"""
+        interleave = loop.interleave
+
+        # XOR (after gather)
+        xor_will_be_in_hash = (seq.fusion_mode == FusionMode.GATHER_XOR and
+                              seq.hash_comp.fuse_xor_with_stage1)
+        if not xor_will_be_in_hash:
+            for c, (p_idx, p_val, p_node_val, _, _, _) in enumerate(chunk_scratch):
+                self.emit("valu", ("^", p_val, p_val, p_node_val))
+            self.flush_schedule()
+
+        # Remaining phases (skip gather)
+        for phase_name in seq.phase_order:
+            if phase_name == "gather":
+                continue  # Already done
+            elif phase_name == "hash":
+                self._compile_hash(seq.hash_comp, chunk_scratch, interleave, seq)
+            elif phase_name == "index":
+                self._compile_index(seq.index_comp, chunk_scratch, interleave)
+            elif phase_name == "store":
+                self._compile_store(seq.store, chunk_scratch, batch_indices, interleave, loop.memory)
+
+        if self.interleave_buffer:
+            self.flush_interleaved(interleave)
+
+    def _compile_single_phase(self, seq: PhaseSequenceNode, chunk_scratch, batch_indices,
+                              loop: LoopNode, phase_name: str, skip_indices: bool = False):
+        """Compile a single phase (for BALANCED pipelining)"""
+        interleave = loop.interleave
+
+        if phase_name == "gather":
+            self._compile_gather(seq.gather, chunk_scratch, interleave, loop.memory)
+            xor_will_be_in_hash = (seq.fusion_mode == FusionMode.GATHER_XOR and
+                                  seq.hash_comp.fuse_xor_with_stage1)
+            if not xor_will_be_in_hash:
+                for c, (p_idx, p_val, p_node_val, _, _, _) in enumerate(chunk_scratch):
+                    self.emit("valu", ("^", p_val, p_val, p_node_val))
+        elif phase_name == "hash":
+            self._compile_hash(seq.hash_comp, chunk_scratch, interleave, seq)
+        elif phase_name == "index":
+            self._compile_index(seq.index_comp, chunk_scratch, interleave)
+        elif phase_name == "store":
+            self._compile_store(seq.store, chunk_scratch, batch_indices, interleave, loop.memory)
 
     def _compile_phases(self, seq: PhaseSequenceNode, chunk_scratch, batch_indices, loop: LoopNode,
                         skip_indices: bool = False):
@@ -1592,6 +2040,74 @@ class GPKernelBuilderV3:
         if self.interleave_buffer:
             self.flush_interleaved(interleave)
 
+    def _compile_phases_fused(self, seq: PhaseSequenceNode, chunk_scratch, batch_indices, loop: LoopNode,
+                              skip_indices: bool = False, is_last_round: bool = False):
+        """Fused phase compilation with minimal flushing between phases.
+
+        In FUSED mode, we reduce synchronization points between phases to maximize
+        instruction-level parallelism. Only flush when absolutely necessary.
+        """
+        interleave = loop.interleave
+        memory = loop.memory
+        coalesce_loads = memory.coalesce_loads if memory else False
+
+        # Load phase - same as regular but with less flushing
+        if skip_indices:
+            for c, (p_idx, p_val, _, _, _, p_addrs) in enumerate(chunk_scratch):
+                self.emit("load", ("const", p_addrs[1], batch_indices[c]))
+            for c, (p_idx, p_val, _, _, _, p_addrs) in enumerate(chunk_scratch):
+                self.emit("alu", ("+", p_addrs[1], self.scratch["inp_values_p"], p_addrs[1]))
+            for c, (p_idx, p_val, _, _, _, p_addrs) in enumerate(chunk_scratch):
+                self.emit("load", ("vload", p_val, p_addrs[1]))
+            # Fused: batch all setup ops before single flush
+            self.flush_schedule()
+        else:
+            for c, (p_idx, p_val, _, _, _, p_addrs) in enumerate(chunk_scratch):
+                self.emit("load", ("const", p_addrs[0], batch_indices[c]))
+                self.emit("load", ("const", p_addrs[1], batch_indices[c]))
+            for c, (p_idx, p_val, _, _, _, p_addrs) in enumerate(chunk_scratch):
+                self.emit("alu", ("+", p_addrs[0], self.scratch["inp_indices_p"], p_addrs[0]))
+                self.emit("alu", ("+", p_addrs[1], self.scratch["inp_values_p"], p_addrs[1]))
+            if coalesce_loads:
+                for c, (p_idx, p_val, _, _, _, p_addrs) in enumerate(chunk_scratch):
+                    self.emit("load", ("vload", p_idx, p_addrs[0]))
+                for c, (p_idx, p_val, _, _, _, p_addrs) in enumerate(chunk_scratch):
+                    self.emit("load", ("vload", p_val, p_addrs[1]))
+            else:
+                for c, (p_idx, p_val, _, _, _, p_addrs) in enumerate(chunk_scratch):
+                    self.emit("load", ("vload", p_idx, p_addrs[0]))
+                    self.emit("load", ("vload", p_val, p_addrs[1]))
+            self.flush_schedule()
+
+        self._skip_indices = skip_indices
+
+        # Execute all phases with minimal flushing
+        for phase_name in seq.phase_order:
+            if phase_name == "gather":
+                self._compile_gather(seq.gather, chunk_scratch, interleave, loop.memory)
+                xor_will_be_in_hash = (seq.fusion_mode == FusionMode.GATHER_XOR and
+                                       seq.hash_comp.fuse_xor_with_stage1)
+                if not xor_will_be_in_hash:
+                    for c, (p_idx, p_val, p_node_val, _, _, _) in enumerate(chunk_scratch):
+                        self.emit("valu", ("^", p_val, p_val, p_node_val))
+                    # Fused: don't flush between gather and XOR
+
+            elif phase_name == "hash":
+                self._compile_hash(seq.hash_comp, chunk_scratch, interleave, seq)
+
+            elif phase_name == "index":
+                self._compile_index(seq.index_comp, chunk_scratch, interleave)
+
+            elif phase_name == "store":
+                self._compile_store(seq.store, chunk_scratch, batch_indices, interleave, loop.memory)
+
+        # Only flush at the end of all phases (or at round boundaries)
+        if is_last_round:
+            self.flush_schedule()
+
+        if self.interleave_buffer:
+            self.flush_interleaved(interleave)
+
     def _compile_gather(self, gather: GatherNode, chunk_scratch, interleave: InterleaveNode,
                         memory: Optional[MemoryNode] = None):
         n_chunks = len(chunk_scratch)
@@ -1645,17 +2161,76 @@ class GPKernelBuilderV3:
         else:
             element_order = list(range(VLEN))
 
+        # Get memory access strategy
+        address_gen = memory.address_gen if memory else AddressGenStrategy.LAZY
+        prefetch_distance = memory.prefetch_distance if memory else 0
+
         if gather.strategy == GatherStrategy.SEQUENTIAL:
-            for vi in element_order:
-                for c, (p_idx, _, p_node_val, _, _, p_addrs) in enumerate(chunk_scratch):
-                    self.emit("alu", ("+", p_addrs[0], self.scratch["forest_values_p"], p_idx + vi), "gather")
+            if address_gen == AddressGenStrategy.EAGER:
+                # EAGER: Compute ALL addresses upfront, then do all loads
+                # Need extra address registers - allocate temporary storage
+                eager_addrs = []
+                for vi in element_order:
+                    tmp_addr = self.alloc_scratch(f"eager_addr_{vi}")
+                    for c, (p_idx, _, p_node_val, _, _, p_addrs) in enumerate(chunk_scratch):
+                        self.emit("alu", ("+", tmp_addr, self.scratch["forest_values_p"], p_idx + vi), "gather")
+                    eager_addrs.append(tmp_addr)
                 self.flush_schedule()
-                for c, (p_idx, _, p_node_val, _, _, p_addrs) in enumerate(chunk_scratch):
-                    self.emit("load", ("load", p_node_val + vi, p_addrs[0]), "gather")
-                    if (c + 1) % 2 == 0:
+
+                # Now issue all loads using pre-computed addresses
+                for vi_idx, vi in enumerate(element_order):
+                    for c, (p_idx, _, p_node_val, _, _, p_addrs) in enumerate(chunk_scratch):
+                        self.emit("load", ("load", p_node_val + vi, eager_addrs[vi_idx]), "gather")
+                        if (c + 1) % 2 == 0:
+                            self.flush_schedule()
+                    if n_chunks % 2 != 0:
                         self.flush_schedule()
-                if n_chunks % 2 != 0:
+                    self.maybe_flush(gather.flush_per_element)
+
+            elif prefetch_distance > 0:
+                # SPECULATIVE with prefetch: issue prefetch hints ahead of actual loads
+                for vi_idx, vi in enumerate(element_order):
+                    # Compute address for current element
+                    for c, (p_idx, _, p_node_val, _, _, p_addrs) in enumerate(chunk_scratch):
+                        self.emit("alu", ("+", p_addrs[0], self.scratch["forest_values_p"], p_idx + vi), "gather")
                     self.flush_schedule()
+
+                    # Issue prefetch for future element if within bounds
+                    future_vi_idx = vi_idx + prefetch_distance
+                    if future_vi_idx < len(element_order):
+                        future_vi = element_order[future_vi_idx]
+                        for c, (p_idx, _, p_node_val, p_tmp1, _, _) in enumerate(chunk_scratch):
+                            # Compute prefetch address in temp
+                            self.emit("alu", ("+", p_tmp1, self.scratch["forest_values_p"], p_idx + future_vi), "gather")
+                        self.flush_schedule()
+                        # Issue prefetch hints (using load with special dest that signals prefetch)
+                        for c, (p_idx, _, p_node_val, p_tmp1, _, _) in enumerate(chunk_scratch):
+                            # Prefetch hint - load into same location (will be overwritten later)
+                            self.emit("load", ("load", p_node_val + future_vi, p_tmp1), "gather")
+
+                    # Issue actual load for current element
+                    for c, (p_idx, _, p_node_val, _, _, p_addrs) in enumerate(chunk_scratch):
+                        self.emit("load", ("load", p_node_val + vi, p_addrs[0]), "gather")
+                        if (c + 1) % 2 == 0:
+                            self.flush_schedule()
+                    if n_chunks % 2 != 0:
+                        self.flush_schedule()
+                    self.maybe_flush(gather.flush_per_element)
+
+            else:
+                # LAZY (default): Compute address just before each load
+                for vi in element_order:
+                    for c, (p_idx, _, p_node_val, _, _, p_addrs) in enumerate(chunk_scratch):
+                        self.emit("alu", ("+", p_addrs[0], self.scratch["forest_values_p"], p_idx + vi), "gather")
+                    self.flush_schedule()
+                    for c, (p_idx, _, p_node_val, _, _, p_addrs) in enumerate(chunk_scratch):
+                        self.emit("load", ("load", p_node_val + vi, p_addrs[0]), "gather")
+                        if (c + 1) % 2 == 0:
+                            self.flush_schedule()
+                    if n_chunks % 2 != 0:
+                        self.flush_schedule()
+                    # flush_per_element: flush after each vector element is loaded
+                    self.maybe_flush(gather.flush_per_element)
 
         elif gather.strategy == GatherStrategy.DUAL_ADDR:
             for vi in range(0, VLEN, 2):
@@ -1667,31 +2242,100 @@ class GPKernelBuilderV3:
                     self.emit("load", ("load", p_node_val + vi, p_addrs[0]), "gather")
                     self.emit("load", ("load", p_node_val + vi + 1, p_addrs[1]), "gather")
                     self.flush_schedule()
+                # flush_per_element: flush after each pair of elements
+                self.maybe_flush(gather.flush_per_element)
 
         elif gather.strategy in (GatherStrategy.BATCH_ADDR, GatherStrategy.PIPELINED, GatherStrategy.VECTORIZED):
             # With inner_unroll: process N elements at a time using available address registers
             # N is limited by max_addr_regs (configurable per chunk)
             inner_unroll = gather.inner_unroll
             max_addr_regs = gather.max_addr_regs
+            vector_grouping = gather.vector_grouping
+            addr_compute_ahead = gather.addr_compute_ahead
 
             if inner_unroll >= 2:
                 # Process up to max_addr_regs elements at a time
                 group_size = min(inner_unroll, max_addr_regs)
-                for vi_base in range(0, len(element_order), group_size):
-                    vi_group = element_order[vi_base:vi_base + group_size]
 
-                    # Compute addresses for group
-                    for ui, vi in enumerate(vi_group):
-                        for c, (p_idx, _, p_node_val, _, _, p_addrs) in enumerate(chunk_scratch):
-                            self.emit("alu", ("+", p_addrs[ui], self.scratch["forest_values_p"], p_idx + vi), "gather")
+                if addr_compute_ahead > 0 and len(element_order) > group_size:
+                    # Software pipelining: compute addresses ahead of loads
+                    # Prologue: compute addresses for first addr_compute_ahead groups
+                    groups = [element_order[i:i + group_size] for i in range(0, len(element_order), group_size)]
+                    n_groups = len(groups)
 
-                    self.maybe_flush(gather.flush_after_addr)
+                    # Prologue: precompute addresses for initial groups
+                    for g_idx in range(min(addr_compute_ahead, n_groups)):
+                        vi_group = groups[g_idx]
+                        for ui, vi in enumerate(vi_group):
+                            for c, (p_idx, _, p_node_val, _, _, p_addrs) in enumerate(chunk_scratch):
+                                self.emit("alu", ("+", p_addrs[ui], self.scratch["forest_values_p"], p_idx + vi), "gather")
+                        self.flush_schedule()
 
-                    # Issue loads for group - must flush before next group's address computation
-                    for ui, vi in enumerate(vi_group):
-                        for c, (p_idx, _, p_node_val, _, _, p_addrs) in enumerate(chunk_scratch):
-                            self.emit("load", ("load", p_node_val + vi, p_addrs[ui]), "gather")
-                    self.flush_schedule()
+                    # Main loop: issue loads while computing next addresses
+                    for g_idx in range(n_groups):
+                        vi_group = groups[g_idx]
+
+                        # Issue loads for current group
+                        for ui, vi in enumerate(vi_group):
+                            for c, (p_idx, _, p_node_val, _, _, p_addrs) in enumerate(chunk_scratch):
+                                self.emit("load", ("load", p_node_val + vi, p_addrs[ui]), "gather")
+
+                        # Compute addresses for future group (if any)
+                        future_g_idx = g_idx + addr_compute_ahead
+                        if future_g_idx < n_groups:
+                            future_group = groups[future_g_idx]
+                            for ui, vi in enumerate(future_group):
+                                for c, (p_idx, _, p_node_val, _, _, p_addrs) in enumerate(chunk_scratch):
+                                    self.emit("alu", ("+", p_addrs[ui], self.scratch["forest_values_p"], p_idx + vi), "gather")
+
+                        self.flush_schedule()
+                        self.maybe_flush(gather.flush_per_element)
+
+                elif vector_grouping > 1 and n_chunks >= vector_grouping:
+                    # Vector grouping: process multiple chunks together for better locality
+                    for vi_base in range(0, len(element_order), group_size):
+                        vi_group = element_order[vi_base:vi_base + group_size]
+
+                        # Process chunks in groups of vector_grouping
+                        for cg_start in range(0, n_chunks, vector_grouping):
+                            cg_end = min(cg_start + vector_grouping, n_chunks)
+
+                            # Compute addresses for chunk group
+                            for ui, vi in enumerate(vi_group):
+                                for c in range(cg_start, cg_end):
+                                    p_idx, _, p_node_val, _, _, p_addrs = chunk_scratch[c]
+                                    self.emit("alu", ("+", p_addrs[ui], self.scratch["forest_values_p"], p_idx + vi), "gather")
+
+                            self.maybe_flush(gather.flush_after_addr)
+
+                            # Issue loads for chunk group
+                            for ui, vi in enumerate(vi_group):
+                                for c in range(cg_start, cg_end):
+                                    p_idx, _, p_node_val, _, _, p_addrs = chunk_scratch[c]
+                                    self.emit("load", ("load", p_node_val + vi, p_addrs[ui]), "gather")
+                            self.flush_schedule()
+
+                        self.maybe_flush(gather.flush_per_element)
+
+                else:
+                    # Original: process all chunks together per element group
+                    for vi_base in range(0, len(element_order), group_size):
+                        vi_group = element_order[vi_base:vi_base + group_size]
+
+                        # Compute addresses for group
+                        for ui, vi in enumerate(vi_group):
+                            for c, (p_idx, _, p_node_val, _, _, p_addrs) in enumerate(chunk_scratch):
+                                self.emit("alu", ("+", p_addrs[ui], self.scratch["forest_values_p"], p_idx + vi), "gather")
+
+                        self.maybe_flush(gather.flush_after_addr)
+
+                        # Issue loads for group - must flush before next group's address computation
+                        for ui, vi in enumerate(vi_group):
+                            for c, (p_idx, _, p_node_val, _, _, p_addrs) in enumerate(chunk_scratch):
+                                self.emit("load", ("load", p_node_val + vi, p_addrs[ui]), "gather")
+                        self.flush_schedule()
+                        # flush_per_element: flush after each group of elements
+                        self.maybe_flush(gather.flush_per_element)
             else:
                 # No unrolling: original per-element processing
                 for vi in element_order:
@@ -1708,12 +2352,15 @@ class GPKernelBuilderV3:
                             self.flush_schedule()
                     if n_chunks % 2 != 0:
                         self.flush_schedule()
+                    # flush_per_element: flush after each element
+                    self.maybe_flush(gather.flush_per_element)
 
     def _compile_hash(self, hash_node: HashNode, chunk_scratch, interleave: InterleaveNode, seq: PhaseSequenceNode):
         has_preloaded = hash_node.use_preloaded_consts and len(self.vec_const_map) > 3
         fuse_xor = seq.fusion_mode == FusionMode.GATHER_XOR and hash_node.fuse_xor_with_stage1
         stage_unroll = hash_node.stage_unroll
         cross_chunk = hash_node.cross_chunk_interleave
+        strategy = hash_node.strategy
 
         # Allocate dedicated scratch for hash constants
         # These are needed as fallback even when has_preloaded=True if specific constants
@@ -1724,7 +2371,73 @@ class GPKernelBuilderV3:
         v_const_a = self._hash_const_a
         v_const_b = self._hash_const_b
 
-        if cross_chunk:
+        # HashStrategy affects how we process the hash stages:
+        # - STANDARD: process each stage fully before the next
+        # - FUSED: fuse operations within each stage (fewer flushes)
+        # - INTERLEAVED: interleave operations across chunks (like cross_chunk)
+        # - UNROLLED: unroll stages more aggressively (process multiple stages together)
+
+        # INTERLEAVED strategy enables cross-chunk processing
+        use_cross_chunk = cross_chunk or strategy == HashStrategy.INTERLEAVED
+
+        # UNROLLED strategy processes all 4 stages with minimal flushing
+        if strategy == HashStrategy.UNROLLED:
+            # Process all stages with minimal flushing - maximum instruction-level parallelism
+            for stage_idx, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                if fuse_xor and stage_idx == 0:
+                    for c, (p_idx, p_val, p_node_val, _, _, _) in enumerate(chunk_scratch):
+                        self.emit("valu", ("^", p_val, p_val, p_node_val), "hash")
+
+                if has_preloaded and val1 in self.vec_const_map:
+                    vc1 = self.vec_const_map[val1]
+                    vc3 = self.vec_const_map[val3]
+                    for c, (_, p_val, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
+                        self.emit("valu", (op1, p_tmp1, p_val, vc1), "hash")
+                        self.emit("valu", (op3, p_tmp2, p_val, vc3), "hash")
+                        self.emit("valu", (op2, p_val, p_tmp1, p_tmp2), "hash")
+                else:
+                    self.emit("valu", ("vbroadcast", v_const_a, self.get_const(val1)), "hash")
+                    self.emit("valu", ("vbroadcast", v_const_b, self.get_const(val3)), "hash")
+                    for c, (_, p_val, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
+                        self.emit("valu", (op1, p_tmp1, p_val, v_const_a), "hash")
+                        self.emit("valu", (op3, p_tmp2, p_val, v_const_b), "hash")
+                        self.emit("valu", (op2, p_val, p_tmp1, p_tmp2), "hash")
+
+            # Single flush at the end for maximum pipelining
+            self.flush_schedule()
+
+        elif strategy == HashStrategy.FUSED:
+            # FUSED: combine all operations within each stage before flushing
+            for stage_idx, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                if fuse_xor and stage_idx == 0:
+                    for c, (p_idx, p_val, p_node_val, _, _, _) in enumerate(chunk_scratch):
+                        self.emit("valu", ("^", p_val, p_val, p_node_val), "hash")
+
+                if has_preloaded and val1 in self.vec_const_map:
+                    vc1 = self.vec_const_map[val1]
+                    vc3 = self.vec_const_map[val3]
+                    # Fused: emit all ops for this stage without intermediate flushes
+                    for c, (_, p_val, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
+                        self.emit("valu", (op1, p_tmp1, p_val, vc1), "hash")
+                        self.emit("valu", (op3, p_tmp2, p_val, vc3), "hash")
+                    for c, (_, p_val, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
+                        self.emit("valu", (op2, p_val, p_tmp1, p_tmp2), "hash")
+                else:
+                    self.emit("valu", ("vbroadcast", v_const_a, self.get_const(val1)), "hash")
+                    self.emit("valu", ("vbroadcast", v_const_b, self.get_const(val3)), "hash")
+                    for c, (_, p_val, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
+                        self.emit("valu", (op1, p_tmp1, p_val, v_const_a), "hash")
+                        self.emit("valu", (op3, p_tmp2, p_val, v_const_b), "hash")
+                    for c, (_, p_val, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
+                        self.emit("valu", (op2, p_val, p_tmp1, p_tmp2), "hash")
+
+                # Flush once per stage
+                self.flush_schedule()
+                self.maybe_flush(hash_node.flush_per_stage)
+
+            self.flush_schedule()
+
+        elif use_cross_chunk:
             # Cross-chunk interleaving: process operations from different chunks together
             # This improves ILP by having more independent operations in flight
             for stage_idx, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
@@ -1813,6 +2526,7 @@ class GPKernelBuilderV3:
         has_n_nodes = "n_nodes" in self.vec_const_map
         compute_unroll = index_node.compute_unroll
         speculative = index_node.speculative
+        flush_per_op = index_node.flush_per_op
 
         if has_preloaded:
             vc_zero = self.vec_const_map[0]
@@ -1821,9 +2535,12 @@ class GPKernelBuilderV3:
         else:
             vc_zero = vc_one = vc_two = None
 
-        # Helper to conditionally flush based on unroll factor
+        # Helper to conditionally flush based on unroll factor and flush_per_op
         def maybe_flush_unroll(step: int):
-            if compute_unroll == 1 or step % compute_unroll == 0:
+            # flush_per_op: flush after every operation
+            if flush_per_op:
+                self.flush_schedule()
+            elif compute_unroll == 1 or step % compute_unroll == 0:
                 self.flush_schedule()
 
         if speculative and has_preloaded:
