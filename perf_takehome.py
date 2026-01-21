@@ -35,25 +35,26 @@ from problem import (
 
 
 class KernelBuilder:
+    """
+    Optimized VLIW kernel builder using:
+    - SIMD vectorization (VLEN=8)
+    - Parallel chunk processing (2 chunks)
+    - Preloaded vector constants
+    - Arithmetic instead of vselect where possible
+    - Dependency-aware VLIW scheduling
+    """
+
     def __init__(self):
         self.instrs = []
         self.scratch = {}
         self.scratch_debug = {}
         self.scratch_ptr = 0
         self.const_map = {}
+        self.vec_const_map = {}
+        self.pending_slots = []
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
-
-    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
-        # Simple slot packing that just uses one slot per instruction bundle
-        instrs = []
-        for engine, slot in slots:
-            instrs.append({engine: [slot]})
-        return instrs
-
-    def add(self, engine, slot):
-        self.instrs.append({engine: [slot]})
 
     def alloc_scratch(self, name=None, length=1):
         addr = self.scratch_ptr
@@ -64,110 +65,251 @@ class KernelBuilder:
         assert self.scratch_ptr <= SCRATCH_SIZE, "Out of scratch space"
         return addr
 
-    def scratch_const(self, val, name=None):
+    def alloc_vector_scratch(self, name=None):
+        return self.alloc_scratch(name, VLEN)
+
+    def get_const(self, val):
         if val not in self.const_map:
-            addr = self.alloc_scratch(name)
-            self.add("load", ("const", addr, val))
+            addr = self.alloc_scratch(f"const_{val}")
             self.const_map[val] = addr
+            self.instrs.append({"load": [("const", addr, val)]})
         return self.const_map[val]
 
-    def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
-        slots = []
+    def emit(self, engine, slot):
+        self.pending_slots.append((engine, slot))
 
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
-            slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
-            slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
-            slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
+    def _get_slot_reads_writes(self, engine, slot):
+        reads, writes = set(), set()
+        op = slot[0]
+        if engine == "alu":
+            writes.add(slot[1])
+            reads.add(slot[2])
+            reads.add(slot[3])
+        elif engine == "valu":
+            if op == "vbroadcast":
+                for i in range(VLEN):
+                    writes.add(slot[1] + i)
+                reads.add(slot[2])
+            else:
+                for i in range(VLEN):
+                    writes.add(slot[1] + i)
+                    reads.add(slot[2] + i)
+                    reads.add(slot[3] + i)
+        elif engine == "load":
+            if op == "const":
+                writes.add(slot[1])
+            elif op == "load":
+                writes.add(slot[1])
+                reads.add(slot[2])
+            elif op == "vload":
+                for i in range(VLEN):
+                    writes.add(slot[1] + i)
+                reads.add(slot[2])
+        elif engine == "store":
+            if op == "store":
+                reads.add(slot[1])
+                reads.add(slot[2])
+            elif op == "vstore":
+                reads.add(slot[1])
+                for i in range(VLEN):
+                    reads.add(slot[2] + i)
+        elif engine == "flow":
+            if op in ("select", "vselect"):
+                writes.add(slot[1])
+                reads.add(slot[2])
+                reads.add(slot[3])
+                reads.add(slot[4])
+                if op == "vselect":
+                    for i in range(VLEN):
+                        writes.add(slot[1] + i)
+                        reads.add(slot[2] + i)
+                        reads.add(slot[3] + i)
+                        reads.add(slot[4] + i)
+        return reads, writes
 
-        return slots
+    def _has_dependency(self, slot1_info, slot2_info):
+        _, _, _, writes1, _ = slot1_info
+        _, _, reads2, writes2, _ = slot2_info
+        return bool(writes1 & reads2) or bool(writes1 & writes2)
 
-    def build_kernel(
-        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
-    ):
-        """
-        Like reference_kernel2 but building actual instructions.
-        Scalar implementation using only scalar ALU and load/store.
-        """
+    def flush_schedule(self):
+        if not self.pending_slots:
+            return
+        slots_info = []
+        for engine, slot in self.pending_slots:
+            reads, writes = self._get_slot_reads_writes(engine, slot)
+            slots_info.append([engine, slot, reads, writes, False])
+        n = len(slots_info)
+        must_precede = [set() for _ in range(n)]
+        for i in range(n):
+            for j in range(i + 1, n):
+                if self._has_dependency(slots_info[i], slots_info[j]):
+                    must_precede[j].add(i)
+        scheduled = [False] * n
+        while not all(scheduled):
+            ready = [i for i in range(n) if not scheduled[i] and all(scheduled[p] for p in must_precede[i])]
+            if not ready:
+                for i in range(n):
+                    if not scheduled[i]:
+                        engine, slot, _, _, _ = slots_info[i]
+                        self.instrs.append({engine: [slot]})
+                        scheduled[i] = True
+                break
+            bundle = {}
+            slots_in_bundle = set()
+            bundle_writes = set()
+            for i in ready:
+                engine, slot, reads, writes, _ = slots_info[i]
+                limit = SLOT_LIMITS.get(engine, 0)
+                current = len(bundle.get(engine, []))
+                if writes & bundle_writes:
+                    continue
+                if current < limit:
+                    bundle.setdefault(engine, []).append(slot)
+                    slots_in_bundle.add(i)
+                    bundle_writes |= writes
+            if bundle:
+                self.instrs.append(bundle)
+                for i in slots_in_bundle:
+                    scheduled[i] = True
+        self.pending_slots = []
+
+    def build_kernel(self, forest_height: int, n_nodes: int, batch_size: int, rounds: int):
+        """Optimized vectorized kernel with parallel chunks"""
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
-        tmp3 = self.alloc_scratch("tmp3")
-        # Scratch space addresses
-        init_vars = [
-            "rounds",
-            "n_nodes",
-            "batch_size",
-            "forest_height",
-            "forest_values_p",
-            "inp_indices_p",
-            "inp_values_p",
-        ]
+
+        # Header variables
+        init_vars = ["rounds", "n_nodes", "batch_size", "forest_height",
+                     "forest_values_p", "inp_indices_p", "inp_values_p"]
         for v in init_vars:
             self.alloc_scratch(v, 1)
         for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
+            self.emit("load", ("const", tmp1, i))
+            self.flush_schedule()
+            self.emit("load", ("load", self.scratch[v], tmp1))
+            self.flush_schedule()
 
-        zero_const = self.scratch_const(0)
-        one_const = self.scratch_const(1)
-        two_const = self.scratch_const(2)
+        # Preload scalar constants
+        for val in [0, 1, 2]:
+            self.get_const(val)
+        for _, val1, _, _, val3 in HASH_STAGES:
+            self.get_const(val1)
+            self.get_const(val3)
 
-        # Pause instructions are matched up with yield statements in the reference
-        # kernel to let you debug at intermediate steps. The testing harness in this
-        # file requires these match up to the reference kernel's yields, but the
-        # submission harness ignores them.
-        self.add("flow", ("pause",))
-        # Any debug engine instruction is ignored by the submission simulator
-        self.add("debug", ("comment", "Starting loop"))
+        # Preload vector constants
+        for val in [0, 1, 2]:
+            v_addr = self.alloc_vector_scratch(f"vconst_{val}")
+            self.vec_const_map[val] = v_addr
+            self.emit("valu", ("vbroadcast", v_addr, self.get_const(val)))
+        for _, val1, _, _, val3 in HASH_STAGES:
+            if val1 not in self.vec_const_map:
+                v_addr = self.alloc_vector_scratch(f"vconst_{val1:x}")
+                self.vec_const_map[val1] = v_addr
+                self.emit("valu", ("vbroadcast", v_addr, self.get_const(val1)))
+            if val3 not in self.vec_const_map:
+                v_addr = self.alloc_vector_scratch(f"vconst_{val3}")
+                self.vec_const_map[val3] = v_addr
+                self.emit("valu", ("vbroadcast", v_addr, self.get_const(val3)))
+        self.flush_schedule()
 
-        body = []  # array of slots
+        self.instrs.append({"flow": [("pause",)]})
 
-        # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
-        tmp_node_val = self.alloc_scratch("tmp_node_val")
-        tmp_addr = self.alloc_scratch("tmp_addr")
+        # Allocate parallel chunk scratch (2 chunks)
+        n_chunks = 2
+        parallel_scratch = []
+        for c in range(n_chunks):
+            p_idx = self.alloc_vector_scratch(f"p{c}_idx")
+            p_val = self.alloc_vector_scratch(f"p{c}_val")
+            p_node_val = self.alloc_vector_scratch(f"p{c}_node_val")
+            p_tmp1 = self.alloc_vector_scratch(f"p{c}_tmp1")
+            p_tmp2 = self.alloc_vector_scratch(f"p{c}_tmp2")
+            p_tmp_addr = self.alloc_scratch(f"p{c}_tmp_addr")
+            p_base_addr = self.alloc_scratch(f"p{c}_base_addr")
+            parallel_scratch.append((p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr))
 
-        for round in range(rounds):
-            for i in range(batch_size):
-                i_const = self.scratch_const(i)
-                # idx = mem[inp_indices_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("load", ("load", tmp_idx, tmp_addr)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
-                # val = mem[inp_values_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("load", ("load", tmp_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
-                # node_val = mem[forest_values_p + idx]
-                body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
-                body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
-                # val = myhash(val ^ node_val)
-                body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
-                body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-                body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-                body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
-                # idx = 0 if idx >= n_nodes else idx
-                body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-                body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
-                # mem[inp_indices_p + i] = idx
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_idx)))
-                # mem[inp_values_p + i] = val
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_val)))
+        vc_zero = self.vec_const_map[0]
+        vc_two = self.vec_const_map[2]
+        chunk_size = VLEN
+        chunks_per_round = batch_size // (chunk_size * n_chunks)
 
-        body_instrs = self.build(body)
-        self.instrs.extend(body_instrs)
-        # Required to match with the yield in reference_kernel2
+        # Main loop
+        for _ in range(rounds):
+            for chunk_group in range(chunks_per_round):
+                batch_indices = [chunk_group * n_chunks * chunk_size + c * chunk_size for c in range(n_chunks)]
+
+                # Phase 1: Load indices and values
+                for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_scratch):
+                    self.emit("load", ("const", p_base_addr, batch_indices[c]))
+                    self.emit("load", ("const", p_tmp_addr, batch_indices[c]))
+                for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_scratch):
+                    self.emit("alu", ("+", p_base_addr, self.scratch["inp_indices_p"], p_base_addr))
+                    self.emit("alu", ("+", p_tmp_addr, self.scratch["inp_values_p"], p_tmp_addr))
+                self.flush_schedule()
+                for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_scratch):
+                    self.emit("load", ("vload", p_idx, p_base_addr))
+                    self.emit("load", ("vload", p_val, p_tmp_addr))
+                self.flush_schedule()
+
+                # Phase 2: Gather node_val
+                for vi in range(VLEN):
+                    for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_scratch):
+                        self.emit("alu", ("+", p_tmp_addr, self.scratch["forest_values_p"], p_idx + vi))
+                        self.emit("load", ("load", p_node_val + vi, p_tmp_addr))
+                self.flush_schedule()
+
+                # Phase 3: XOR
+                for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_scratch):
+                    self.emit("valu", ("^", p_val, p_val, p_node_val))
+                self.flush_schedule()
+
+                # Phase 4: Hash
+                for op1, val1, op2, op3, val3 in HASH_STAGES:
+                    vc1 = self.vec_const_map[val1]
+                    vc3 = self.vec_const_map[val3]
+                    for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_scratch):
+                        self.emit("valu", (op1, p_tmp1, p_val, vc1))
+                        self.emit("valu", (op3, p_tmp2, p_val, vc3))
+                    self.flush_schedule()
+                    for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_scratch):
+                        self.emit("valu", (op2, p_val, p_tmp1, p_tmp2))
+                self.flush_schedule()
+
+                # Phase 5: Index computation (arithmetic instead of vselect)
+                for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_scratch):
+                    self.emit("valu", ("%", p_tmp2, p_val, vc_two))
+                    self.emit("valu", ("*", p_idx, p_idx, vc_two))
+                self.flush_schedule()
+                for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_scratch):
+                    self.emit("valu", ("==", p_tmp2, p_tmp2, vc_zero))
+                self.flush_schedule()
+                for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_scratch):
+                    self.emit("valu", ("-", p_tmp1, vc_two, p_tmp2))
+                self.flush_schedule()
+                for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_scratch):
+                    self.emit("valu", ("+", p_idx, p_idx, p_tmp1))
+                    self.emit("valu", ("vbroadcast", p_tmp1, self.scratch["n_nodes"]))
+                self.flush_schedule()
+                for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_scratch):
+                    self.emit("valu", ("<", p_tmp2, p_idx, p_tmp1))
+                self.flush_schedule()
+                for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_scratch):
+                    self.emit("valu", ("*", p_idx, p_idx, p_tmp2))
+                self.flush_schedule()
+
+                # Phase 6: Store results
+                for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_scratch):
+                    self.emit("load", ("const", p_base_addr, batch_indices[c]))
+                    self.emit("load", ("const", p_tmp_addr, batch_indices[c]))
+                for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_scratch):
+                    self.emit("alu", ("+", p_base_addr, self.scratch["inp_indices_p"], p_base_addr))
+                    self.emit("alu", ("+", p_tmp_addr, self.scratch["inp_values_p"], p_tmp_addr))
+                self.flush_schedule()
+                for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_scratch):
+                    self.emit("store", ("vstore", p_base_addr, p_idx))
+                    self.emit("store", ("vstore", p_tmp_addr, p_val))
+                self.flush_schedule()
+
         self.instrs.append({"flow": [("pause",)]})
 
 BASELINE = 147734
