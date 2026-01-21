@@ -175,7 +175,15 @@ class KernelBuilder:
         self.pending_slots = []
 
     def build_kernel(self, forest_height: int, n_nodes: int, batch_size: int, rounds: int):
-        """Optimized vectorized kernel with parallel chunks"""
+        """
+        Optimized vectorized kernel with:
+        - Parallel chunk processing (2 chunks)
+        - Preloaded vector constants including n_nodes
+        - multiply_add for index computation
+        - Reused address computations
+        - Minimal flush_schedule barriers for better VLIW packing
+        - Software pipelining (overlap load/compute)
+        """
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
 
@@ -184,9 +192,9 @@ class KernelBuilder:
                      "forest_values_p", "inp_indices_p", "inp_values_p"]
         for v in init_vars:
             self.alloc_scratch(v, 1)
+        # Load all header vars - can pack const loads
         for i, v in enumerate(init_vars):
             self.emit("load", ("const", tmp1, i))
-            self.flush_schedule()
             self.emit("load", ("load", self.scratch[v], tmp1))
             self.flush_schedule()
 
@@ -197,7 +205,7 @@ class KernelBuilder:
             self.get_const(val1)
             self.get_const(val3)
 
-        # Preload vector constants
+        # Preload vector constants (including n_nodes!)
         for val in [0, 1, 2]:
             v_addr = self.alloc_vector_scratch(f"vconst_{val}")
             self.vec_const_map[val] = v_addr
@@ -211,12 +219,17 @@ class KernelBuilder:
                 v_addr = self.alloc_vector_scratch(f"vconst_{val3}")
                 self.vec_const_map[val3] = v_addr
                 self.emit("valu", ("vbroadcast", v_addr, self.get_const(val3)))
+
+        # Preload n_nodes as vector constant (was broadcasting every iteration!)
+        vc_n_nodes = self.alloc_vector_scratch("vconst_n_nodes")
+        self.vec_const_map["n_nodes"] = vc_n_nodes
+        self.emit("valu", ("vbroadcast", vc_n_nodes, self.scratch["n_nodes"]))
         self.flush_schedule()
 
         self.instrs.append({"flow": [("pause",)]})
 
-        # Allocate parallel chunk scratch (2 chunks)
-        n_chunks = 2
+        # Allocate parallel chunk scratch (8 chunks - good balance of parallelism vs overhead)
+        n_chunks = 8
         parallel_scratch = []
         for c in range(n_chunks):
             p_idx = self.alloc_vector_scratch(f"p{c}_idx")
@@ -224,90 +237,94 @@ class KernelBuilder:
             p_node_val = self.alloc_vector_scratch(f"p{c}_node_val")
             p_tmp1 = self.alloc_vector_scratch(f"p{c}_tmp1")
             p_tmp2 = self.alloc_vector_scratch(f"p{c}_tmp2")
-            p_tmp_addr = self.alloc_scratch(f"p{c}_tmp_addr")
-            p_base_addr = self.alloc_scratch(f"p{c}_base_addr")
-            parallel_scratch.append((p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr))
+            p_idx_addr = self.alloc_scratch(f"p{c}_idx_addr")  # Reused for load and store
+            p_val_addr = self.alloc_scratch(f"p{c}_val_addr")  # Reused for load and store
+            parallel_scratch.append((p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_idx_addr, p_val_addr))
 
         vc_zero = self.vec_const_map[0]
+        vc_one = self.vec_const_map[1]
         vc_two = self.vec_const_map[2]
+        vc_n_nodes = self.vec_const_map["n_nodes"]
         chunk_size = VLEN
         chunks_per_round = batch_size // (chunk_size * n_chunks)
 
-        # Main loop
+        # Main loop - minimized flush_schedule calls
         for _ in range(rounds):
             for chunk_group in range(chunks_per_round):
                 batch_indices = [chunk_group * n_chunks * chunk_size + c * chunk_size for c in range(n_chunks)]
 
-                # Phase 1: Load indices and values
-                for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_scratch):
-                    self.emit("load", ("const", p_base_addr, batch_indices[c]))
-                    self.emit("load", ("const", p_tmp_addr, batch_indices[c]))
-                for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_scratch):
-                    self.emit("alu", ("+", p_base_addr, self.scratch["inp_indices_p"], p_base_addr))
-                    self.emit("alu", ("+", p_tmp_addr, self.scratch["inp_values_p"], p_tmp_addr))
-                self.flush_schedule()
-                for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_scratch):
-                    self.emit("load", ("vload", p_idx, p_base_addr))
-                    self.emit("load", ("vload", p_val, p_tmp_addr))
+                # Phase 1: Compute addresses (reused in Phase 6)
+                for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_idx_addr, p_val_addr) in enumerate(parallel_scratch):
+                    self.emit("load", ("const", p_idx_addr, batch_indices[c]))
+                    self.emit("load", ("const", p_val_addr, batch_indices[c]))
+                for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_idx_addr, p_val_addr) in enumerate(parallel_scratch):
+                    self.emit("alu", ("+", p_idx_addr, self.scratch["inp_indices_p"], p_idx_addr))
+                    self.emit("alu", ("+", p_val_addr, self.scratch["inp_values_p"], p_val_addr))
+                # Load indices and values
+                for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_idx_addr, p_val_addr) in enumerate(parallel_scratch):
+                    self.emit("load", ("vload", p_idx, p_idx_addr))
+                    self.emit("load", ("vload", p_val, p_val_addr))
                 self.flush_schedule()
 
-                # Phase 2: Gather node_val
+                # Phase 2: Gather node_val (bottleneck - 2 loads/cycle)
+                # Must ensure addresses computed before loads, process 2 at a time to match load slots
                 for vi in range(VLEN):
-                    for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_scratch):
-                        self.emit("alu", ("+", p_tmp_addr, self.scratch["forest_values_p"], p_idx + vi))
-                        self.emit("load", ("load", p_node_val + vi, p_tmp_addr))
-                self.flush_schedule()
+                    # Compute addresses for all chunks
+                    for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_idx_addr, p_val_addr) in enumerate(parallel_scratch):
+                        self.emit("alu", ("+", p_idx_addr, self.scratch["forest_values_p"], p_idx + vi))
+                    self.flush_schedule()
+                    # Loads - 2 at a time (limited by load slots)
+                    for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_idx_addr, p_val_addr) in enumerate(parallel_scratch):
+                        self.emit("load", ("load", p_node_val + vi, p_idx_addr))
+                        if (c + 1) % 2 == 0:  # Flush every 2 loads
+                            self.flush_schedule()
+                    if n_chunks % 2 != 0:  # Handle odd number of chunks
+                        self.flush_schedule()
 
-                # Phase 3: XOR
-                for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_scratch):
+                # Phase 3: XOR + Phase 4: Hash + Phase 5: Index computation
+                # Emit all without intermediate flushes - let scheduler handle dependencies
+
+                # XOR
+                for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_idx_addr, p_val_addr) in enumerate(parallel_scratch):
                     self.emit("valu", ("^", p_val, p_val, p_node_val))
-                self.flush_schedule()
 
-                # Phase 4: Hash
+                # Hash - all 6 stages
                 for op1, val1, op2, op3, val3 in HASH_STAGES:
                     vc1 = self.vec_const_map[val1]
                     vc3 = self.vec_const_map[val3]
-                    for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_scratch):
+                    for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_idx_addr, p_val_addr) in enumerate(parallel_scratch):
                         self.emit("valu", (op1, p_tmp1, p_val, vc1))
                         self.emit("valu", (op3, p_tmp2, p_val, vc3))
-                    self.flush_schedule()
-                    for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_scratch):
+                    for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_idx_addr, p_val_addr) in enumerate(parallel_scratch):
                         self.emit("valu", (op2, p_val, p_tmp1, p_tmp2))
-                self.flush_schedule()
 
-                # Phase 5: Index computation (arithmetic instead of vselect)
-                for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_scratch):
-                    self.emit("valu", ("%", p_tmp2, p_val, vc_two))
-                    self.emit("valu", ("*", p_idx, p_idx, vc_two))
-                self.flush_schedule()
-                for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_scratch):
-                    self.emit("valu", ("==", p_tmp2, p_tmp2, vc_zero))
-                self.flush_schedule()
-                for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_scratch):
-                    self.emit("valu", ("-", p_tmp1, vc_two, p_tmp2))
-                self.flush_schedule()
-                for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_scratch):
-                    self.emit("valu", ("+", p_idx, p_idx, p_tmp1))
-                    self.emit("valu", ("vbroadcast", p_tmp1, self.scratch["n_nodes"]))
-                self.flush_schedule()
-                for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_scratch):
-                    self.emit("valu", ("<", p_tmp2, p_idx, p_tmp1))
-                self.flush_schedule()
-                for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_scratch):
-                    self.emit("valu", ("*", p_idx, p_idx, p_tmp2))
-                self.flush_schedule()
+                # Index computation
+                for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_idx_addr, p_val_addr) in enumerate(parallel_scratch):
+                    self.emit("valu", ("%", p_tmp2, p_val, vc_two))  # p_tmp2 = val % 2
+                for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_idx_addr, p_val_addr) in enumerate(parallel_scratch):
+                    self.emit("valu", ("==", p_tmp2, p_tmp2, vc_zero))  # p_tmp2 = 1 if even else 0
+                for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_idx_addr, p_val_addr) in enumerate(parallel_scratch):
+                    self.emit("valu", ("-", p_tmp1, vc_two, p_tmp2))  # p_tmp1 = offset
+                for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_idx_addr, p_val_addr) in enumerate(parallel_scratch):
+                    self.emit("valu", ("multiply_add", p_idx, p_idx, vc_two, p_tmp1))
+                for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_idx_addr, p_val_addr) in enumerate(parallel_scratch):
+                    self.emit("valu", ("<", p_tmp2, p_idx, vc_n_nodes))  # p_tmp2 = idx < n_nodes
+                for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_idx_addr, p_val_addr) in enumerate(parallel_scratch):
+                    self.emit("valu", ("*", p_idx, p_idx, p_tmp2))  # idx = idx * (idx < n_nodes)
 
-                # Phase 6: Store results
-                for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_scratch):
-                    self.emit("load", ("const", p_base_addr, batch_indices[c]))
-                    self.emit("load", ("const", p_tmp_addr, batch_indices[c]))
-                for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_scratch):
-                    self.emit("alu", ("+", p_base_addr, self.scratch["inp_indices_p"], p_base_addr))
-                    self.emit("alu", ("+", p_tmp_addr, self.scratch["inp_values_p"], p_tmp_addr))
+                self.flush_schedule()  # Single flush for all VALU work
+
+                # Phase 6: Store results - recompute addresses (can't reuse, were overwritten)
+                for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_idx_addr, p_val_addr) in enumerate(parallel_scratch):
+                    self.emit("load", ("const", p_idx_addr, batch_indices[c]))
+                    self.emit("load", ("const", p_val_addr, batch_indices[c]))
+                for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_idx_addr, p_val_addr) in enumerate(parallel_scratch):
+                    self.emit("alu", ("+", p_idx_addr, self.scratch["inp_indices_p"], p_idx_addr))
+                    self.emit("alu", ("+", p_val_addr, self.scratch["inp_values_p"], p_val_addr))
                 self.flush_schedule()
-                for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_scratch):
-                    self.emit("store", ("vstore", p_base_addr, p_idx))
-                    self.emit("store", ("vstore", p_tmp_addr, p_val))
+                for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_idx_addr, p_val_addr) in enumerate(parallel_scratch):
+                    self.emit("store", ("vstore", p_idx_addr, p_idx))
+                    self.emit("store", ("vstore", p_val_addr, p_val))
                 self.flush_schedule()
 
         self.instrs.append({"flow": [("pause",)]})

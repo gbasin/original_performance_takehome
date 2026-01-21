@@ -89,8 +89,11 @@ class Genome:
 
     # Advanced optimizations
     preload_vector_constants: bool = False  # Precompute constant vectors to avoid vbroadcast
+    preload_n_nodes: bool = False           # Preload n_nodes as vector constant
     software_pipeline: bool = False         # Overlap loads with computation
-    parallel_chunks: int = 1                # Process multiple vector chunks in parallel (1, 2, or 4)
+    parallel_chunks: int = 1                # Process multiple vector chunks in parallel (1-32)
+    use_multiply_add: bool = False          # Use multiply_add for index computation
+    minimize_flushes: bool = False          # Reduce flush_schedule calls for better packing
 
     def __post_init__(self):
         """Clamp values to valid ranges"""
@@ -99,7 +102,11 @@ class Genome:
         self.max_bundle_fill = max(0.05, min(1.0, self.max_bundle_fill))  # Allow very low for safe mode
         self.load_ahead_distance = max(0, min(10, self.load_ahead_distance))
         self.pipeline_depth = max(1, min(4, self.pipeline_depth))  # 1-4 iterations overlapped
-        self.parallel_chunks = max(1, min(4, self.parallel_chunks))  # 1, 2, or 4 chunks
+        # parallel_chunks must divide batch_size evenly: 256/(8*n) must be integer
+        # Valid values: 1, 2, 4, 8, 16, 32
+        valid_chunks = [1, 2, 4, 8, 16, 32]
+        if self.parallel_chunks not in valid_chunks:
+            self.parallel_chunks = min(valid_chunks, key=lambda x: abs(x - self.parallel_chunks))
 
 
 def random_genome() -> Genome:
@@ -115,33 +122,40 @@ def random_genome() -> Genome:
         max_bundle_fill=random.uniform(0.8, 1.0),  # High fill for dependency-aware scheduling
         load_ahead_distance=random.randint(0, 5),
         scratch_allocation=random.choice(list(ScratchAllocation)),
-        preload_constants=random.choice([True, False]),
+        preload_constants=True,  # Always preload - proven beneficial
         use_add_imm=random.choice([True, False]),
         fuse_hash_stages=random.choice([True, False]),
         use_loops=random.choice([True, False]),  # Try both loop-based and unrolled
-        preload_vector_constants=random.choice([True, False]),  # Avoid runtime broadcasts
+        preload_vector_constants=True,  # Always preload - proven beneficial
+        preload_n_nodes=random.choice([True, False]),  # Preload n_nodes vector
         software_pipeline=random.choice([True, False]),
-        parallel_chunks=random.choice([1, 2]),  # Process multiple chunks simultaneously
+        parallel_chunks=random.choice([1, 2, 4, 8, 16, 32]),  # Full range of chunk counts
+        use_multiply_add=random.choice([True, False]),  # Try multiply_add optimization
+        minimize_flushes=random.choice([True, False]),  # Try reducing flush barriers
     )
 
 
 def baseline_genome() -> Genome:
-    """Genome that approximates the baseline scalar implementation"""
+    """Genome with our best known optimizations"""
     return Genome(
         batch_unroll_factor=1,
         round_unroll_factor=1,
         loop_order=LoopOrder.ROUND_BATCH,
         vectorize_batch=True,  # Enable vectorization
-        vectorize_hash=False,
+        vectorize_hash=True,
         schedule_strategy=ScheduleStrategy.GREEDY,
         max_bundle_fill=1.0,  # Use dependency-aware scheduling
         load_ahead_distance=0,
         scratch_allocation=ScratchAllocation.COMPACT,
         preload_constants=True,
         use_add_imm=False,
-        fuse_hash_stages=False,
+        fuse_hash_stages=True,
         preload_vector_constants=True,  # Avoid runtime broadcasts
+        preload_n_nodes=True,  # Preload n_nodes as vector
         software_pipeline=False,
+        parallel_chunks=8,  # Good balance of parallelism
+        use_multiply_add=True,  # Use multiply_add for idx computation
+        minimize_flushes=True,  # Reduce barriers for better packing
     )
 
 
@@ -581,7 +595,7 @@ class ParameterizedKernelBuilder:
                     self.emit("valu", ("vbroadcast", v_addr, self.get_const(val)))
 
                 # Hash stage constants
-                for op1, val1, op2, op3, val3 in HASH_STAGES:
+                for _, val1, _, _, val3 in HASH_STAGES:
                     if val1 not in self.vec_const_map:
                         v_addr = self.alloc_vector_scratch(f"vconst_{val1:x}")
                         self.vec_const_map[val1] = v_addr
@@ -590,6 +604,12 @@ class ParameterizedKernelBuilder:
                         v_addr = self.alloc_vector_scratch(f"vconst_{val3}")
                         self.vec_const_map[val3] = v_addr
                         self.emit("valu", ("vbroadcast", v_addr, self.get_const(val3)))
+
+                # Preload n_nodes as vector constant if enabled
+                if genome.preload_n_nodes:
+                    v_addr = self.alloc_vector_scratch("vconst_n_nodes")
+                    self.vec_const_map["n_nodes"] = v_addr
+                    self.emit("valu", ("vbroadcast", v_addr, self.scratch["n_nodes"]))
 
                 self.flush_schedule()
 
@@ -1119,50 +1139,55 @@ class ParameterizedKernelBuilder:
         """
         Process multiple vector chunks in parallel to maximize VLIW utilization.
         Interleaves operations from different chunks so the scheduler can pack them.
+        Uses genome parameters for optimizations.
         """
+        genome = self.genome
         has_preloaded = hasattr(self, 'vec_const_map') and len(self.vec_const_map) > 3
-        chunk_size = VLEN  # Each chunk is VLEN elements
+        has_n_nodes_preloaded = hasattr(self, 'vec_const_map') and "n_nodes" in self.vec_const_map
+        use_multiply_add = genome.use_multiply_add
+        minimize_flushes = genome.minimize_flushes
+        chunk_size = VLEN
         chunks_per_round = batch_size // (chunk_size * n_chunks)
 
-        for r in range(rounds):
+        for _ in range(rounds):
             for chunk_group in range(chunks_per_round):
-                # Calculate batch indices for each chunk
                 batch_indices = [chunk_group * n_chunks * chunk_size + c * chunk_size for c in range(n_chunks)]
 
-                # Phase 1: Load indices and values for ALL chunks (interleaved)
+                # Phase 1: Load indices and values for ALL chunks
                 for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_vec_scratch):
                     self.emit("load", ("const", p_base_addr, batch_indices[c]))
                     self.emit("load", ("const", p_tmp_addr, batch_indices[c]))
                 for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_vec_scratch):
                     self.emit("alu", ("+", p_base_addr, self.scratch["inp_indices_p"], p_base_addr))
                     self.emit("alu", ("+", p_tmp_addr, self.scratch["inp_values_p"], p_tmp_addr))
-                self.flush_schedule()
-
                 for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_vec_scratch):
                     self.emit("load", ("vload", p_idx, p_base_addr))
                     self.emit("load", ("vload", p_val, p_tmp_addr))
                 self.flush_schedule()
 
-                # Phase 2: Gather node_val for ALL chunks
-                # Emit all ALU ops and loads together, let scheduler pack them
-                # The scheduler will respect dependencies (ALU must complete before load can use address)
+                # Phase 2: Gather node_val (bottleneck - 2 loads/cycle)
                 for vi in range(VLEN):
                     for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_vec_scratch):
                         self.emit("alu", ("+", p_tmp_addr, self.scratch["forest_values_p"], p_idx + vi))
+                    self.flush_schedule()
+                    for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_vec_scratch):
                         self.emit("load", ("load", p_node_val + vi, p_tmp_addr))
-                self.flush_schedule()
+                        if (c + 1) % 2 == 0:
+                            self.flush_schedule()
+                    if n_chunks % 2 != 0:
+                        self.flush_schedule()
 
-                # Phase 3: XOR for all chunks
+                # Phase 3: XOR
                 for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_vec_scratch):
                     self.emit("valu", ("^", p_val, p_val, p_node_val))
-                self.flush_schedule()
+                if not minimize_flushes:
+                    self.flush_schedule()
 
-                # Phase 4: Hash - INTERLEAVE stages across chunks for better packing
+                # Phase 4: Hash
                 for op1, val1, op2, op3, val3 in HASH_STAGES:
                     if has_preloaded and val1 in self.vec_const_map and val3 in self.vec_const_map:
                         vc1 = self.vec_const_map[val1]
                         vc3 = self.vec_const_map[val3]
-                        # Emit op1 and op3 for ALL chunks (they're independent!)
                         for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_vec_scratch):
                             self.emit("valu", (op1, p_tmp1, p_val, vc1))
                             self.emit("valu", (op3, p_tmp2, p_val, vc3))
@@ -1173,51 +1198,63 @@ class ParameterizedKernelBuilder:
                             self.emit("valu", (op1, p_tmp1, p_val, v_const_a))
                             self.emit("valu", (op3, p_tmp2, p_val, v_const_b))
                     self.flush_schedule()
-                    # Emit op2 for ALL chunks
                     for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_vec_scratch):
                         self.emit("valu", (op2, p_val, p_tmp1, p_tmp2))
                 self.flush_schedule()
 
-                # Phase 5: Index computation for all chunks
-                # Optimization: replace vselects with arithmetic where possible
+                # Phase 5: Index computation
                 if has_preloaded and 2 in self.vec_const_map:
                     vc_zero = self.vec_const_map[0]
-                    vc_one = self.vec_const_map[1]
                     vc_two = self.vec_const_map[2]
+                    vc_n_nodes = self.vec_const_map.get("n_nodes")
 
+                    # Compute val % 2
                     for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_vec_scratch):
                         self.emit("valu", ("%", p_tmp2, p_val, vc_two))
-                        self.emit("valu", ("*", p_idx, p_idx, vc_two))
                     self.flush_schedule()
 
-                    # tmp2 = (val % 2 == 0), so tmp2 is 0 or 1
-                    # We want: tmp1 = 1 if tmp2 else 2 = 2 - tmp2
+                    # tmp2 = (val % 2 == 0)
                     for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_vec_scratch):
                         self.emit("valu", ("==", p_tmp2, p_tmp2, vc_zero))
                     self.flush_schedule()
 
-                    # Replace vselect with arithmetic: tmp1 = 2 - tmp2
+                    # tmp1 = 2 - tmp2 (offset)
                     for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_vec_scratch):
                         self.emit("valu", ("-", p_tmp1, vc_two, p_tmp2))
                     self.flush_schedule()
 
-                    for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_vec_scratch):
-                        self.emit("valu", ("+", p_idx, p_idx, p_tmp1))
-                        self.emit("valu", ("vbroadcast", p_tmp1, self.scratch["n_nodes"]))
+                    # idx = 2 * idx + offset (use multiply_add if enabled)
+                    if use_multiply_add:
+                        for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_vec_scratch):
+                            self.emit("valu", ("multiply_add", p_idx, p_idx, vc_two, p_tmp1))
+                    else:
+                        for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_vec_scratch):
+                            self.emit("valu", ("*", p_idx, p_idx, vc_two))
+                        self.flush_schedule()
+                        for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_vec_scratch):
+                            self.emit("valu", ("+", p_idx, p_idx, p_tmp1))
                     self.flush_schedule()
 
-                    # tmp2 = (idx < n_nodes), 0 or 1
-                    # We want: idx = idx if tmp2 else 0 = idx * tmp2
-                    for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_vec_scratch):
-                        self.emit("valu", ("<", p_tmp2, p_idx, p_tmp1))
+                    # Bounds check: idx = idx < n_nodes ? idx : 0
+                    if vc_n_nodes is not None and has_n_nodes_preloaded:
+                        # Use preloaded n_nodes vector
+                        for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_vec_scratch):
+                            self.emit("valu", ("<", p_tmp2, p_idx, vc_n_nodes))
+                    else:
+                        # Broadcast n_nodes at runtime
+                        for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_vec_scratch):
+                            self.emit("valu", ("vbroadcast", p_tmp1, self.scratch["n_nodes"]))
+                        self.flush_schedule()
+                        for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_vec_scratch):
+                            self.emit("valu", ("<", p_tmp2, p_idx, p_tmp1))
                     self.flush_schedule()
 
-                    # Replace vselect with arithmetic: idx = idx * tmp2
+                    # idx = idx * tmp2 (gives idx if in bounds, 0 otherwise)
                     for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_vec_scratch):
                         self.emit("valu", ("*", p_idx, p_idx, p_tmp2))
                     self.flush_schedule()
                 else:
-                    # Non-preloaded path (similar but with broadcasts)
+                    # Non-preloaded fallback
                     for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_vec_scratch):
                         self.emit("valu", ("vbroadcast", p_tmp1, two_const))
                     self.flush_schedule()
@@ -1232,15 +1269,23 @@ class ParameterizedKernelBuilder:
                         self.emit("valu", ("==", p_tmp2, p_tmp2, p_tmp1))
                     self.flush_schedule()
                     for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_vec_scratch):
-                        self.emit("valu", ("vbroadcast", p_tmp1, one_const))
+                        self.emit("valu", ("-", p_tmp1, p_tmp1, p_tmp2))  # Fix: use arithmetic
                     self.flush_schedule()
                     for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_vec_scratch):
-                        self.emit("flow", ("vselect", p_tmp1, p_tmp2, p_tmp1, v_const_a))  # Needs fix
+                        self.emit("valu", ("+", p_idx, p_idx, p_tmp1))
                     self.flush_schedule()
-                    # This path needs more work, skip for now
-                    pass
+                    # Bounds check
+                    for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_vec_scratch):
+                        self.emit("valu", ("vbroadcast", p_tmp1, self.scratch["n_nodes"]))
+                    self.flush_schedule()
+                    for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_vec_scratch):
+                        self.emit("valu", ("<", p_tmp2, p_idx, p_tmp1))
+                    self.flush_schedule()
+                    for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_vec_scratch):
+                        self.emit("valu", ("*", p_idx, p_idx, p_tmp2))
+                    self.flush_schedule()
 
-                # Phase 6: Store results for all chunks
+                # Phase 6: Store results
                 for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_vec_scratch):
                     self.emit("load", ("const", p_base_addr, batch_indices[c]))
                     self.emit("load", ("const", p_tmp_addr, batch_indices[c]))
@@ -1248,7 +1293,6 @@ class ParameterizedKernelBuilder:
                     self.emit("alu", ("+", p_base_addr, self.scratch["inp_indices_p"], p_base_addr))
                     self.emit("alu", ("+", p_tmp_addr, self.scratch["inp_values_p"], p_tmp_addr))
                 self.flush_schedule()
-
                 for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_tmp_addr, p_base_addr) in enumerate(parallel_vec_scratch):
                     self.emit("store", ("vstore", p_base_addr, p_idx))
                     self.emit("store", ("vstore", p_tmp_addr, p_val))

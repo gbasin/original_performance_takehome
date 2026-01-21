@@ -194,11 +194,15 @@ class Machine:
                     f'{{"name": "thread_name", "ph": "M", "pid": {len(self.cores) + ci}, "tid": {BASE_ADDR_TID + addr}, "args": {{"name":"{name}-{length}"}}}},\n'
                 )
 
-    def run(self):
+    def run(self, max_cycles: int = 0):
         for core in self.cores:
             if core.state == CoreState.PAUSED:
                 core.state = CoreState.RUNNING
         while any(c.state == CoreState.RUNNING for c in self.cores):
+            if max_cycles > 0 and self.cycle >= max_cycles:
+                for core in self.cores:
+                    core.state = CoreState.STOPPED
+                break
             has_non_debug = False
             for core in self.cores:
                 if core.state != CoreState.RUNNING:
