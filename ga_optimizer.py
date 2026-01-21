@@ -85,6 +85,7 @@ class Genome:
     # Instruction-level tweaks
     use_add_imm: bool = False          # Use add_imm instead of const+add where possible
     fuse_hash_stages: bool = False     # Try to pack hash stages together
+    use_loops: bool = False            # Use actual loop instructions instead of full unrolling
 
     def __post_init__(self):
         """Clamp values to valid ranges"""
@@ -111,6 +112,7 @@ def random_genome() -> Genome:
         preload_constants=random.choice([True, False]),
         use_add_imm=random.choice([True, False]),
         fuse_hash_stages=random.choice([True, False]),
+        use_loops=random.choice([True, False]),  # Try both loop-based and unrolled
     )
 
 
@@ -572,8 +574,14 @@ class ParameterizedKernelBuilder:
         vec_scratch = (v_idx, v_val, v_node_val, v_tmp1, v_tmp2, v_const_a, v_const_b,
                        vec_tmp_addr, vec_base_addr)
 
-        # Generate loop body based on loop order
-        if genome.loop_order == LoopOrder.ROUND_BATCH:
+        # Generate loop body based on loop order and whether to use actual loops
+        if genome.use_loops and genome.vectorize_batch:
+            self._emit_vectorized_loop_based(
+                rounds, batch_size, batch_step,
+                zero_const, one_const, two_const,
+                vec_scratch, tmp1, tmp2, tmp3
+            )
+        elif genome.loop_order == LoopOrder.ROUND_BATCH:
             self._emit_round_batch_loop(
                 rounds, round_unroll, round_iters,
                 batch_size, batch_unroll, batch_iters, batch_step,
@@ -596,6 +604,133 @@ class ParameterizedKernelBuilder:
         self.instrs.append({"flow": [("pause",)]})
 
         return self.instrs
+
+    def _emit_vectorized_loop_based(
+        self, rounds, batch_size, batch_step,
+        zero_const, one_const, two_const,
+        vec_scratch, tmp1, tmp2, tmp3
+    ):
+        """
+        Emit vectorized kernel using actual loop instructions instead of full unrolling.
+        This dramatically reduces code size and may improve cache performance.
+        """
+        v_idx, v_val, v_node_val, v_tmp1, v_tmp2, v_const_a, v_const_b, vec_tmp_addr, vec_base_addr = vec_scratch
+
+        # Allocate loop control variables
+        round_counter = self.alloc_scratch("round_counter")
+        batch_counter = self.alloc_scratch("batch_counter")
+        batch_offset = self.alloc_scratch("batch_offset")  # Current batch position (0, 8, 16, ...)
+        loop_cond = self.alloc_scratch("loop_cond")
+
+        # Constants for loop
+        batch_count = batch_size // batch_step  # Number of vector iterations per round
+        vlen_const = self.get_const(batch_step)
+
+        # Initialize round counter
+        self.emit("load", ("const", round_counter, rounds))
+        self.flush_schedule()
+
+        # Outer loop: rounds
+        round_loop_start = len(self.instrs)
+
+        # Initialize batch counter and offset for this round
+        self.emit("load", ("const", batch_counter, batch_count))
+        self.emit("load", ("const", batch_offset, 0))
+        self.flush_schedule()
+
+        # Inner loop: batch chunks
+        batch_loop_start = len(self.instrs)
+
+        # ===== LOOP BODY: Process one vector chunk =====
+        # Phase 1: Load indices and values
+        self.emit("alu", ("+", vec_base_addr, self.scratch["inp_indices_p"], batch_offset))
+        self.emit("alu", ("+", vec_tmp_addr, self.scratch["inp_values_p"], batch_offset))
+        self.flush_schedule()
+
+        self.emit("load", ("vload", v_idx, vec_base_addr))
+        self.emit("load", ("vload", v_val, vec_tmp_addr))
+        self.flush_schedule()
+
+        # Phase 2: Gather node_val (dual-load optimization)
+        tmp_addr2 = vec_base_addr  # Reuse for second address
+        for vi in range(0, VLEN, 2):
+            self.emit("alu", ("+", vec_tmp_addr, self.scratch["forest_values_p"], v_idx + vi))
+            self.emit("alu", ("+", tmp_addr2, self.scratch["forest_values_p"], v_idx + vi + 1))
+            self.flush_schedule()
+            self.emit("load", ("load", v_node_val + vi, vec_tmp_addr))
+            self.emit("load", ("load", v_node_val + vi + 1, tmp_addr2))
+        self.flush_schedule()
+
+        # Phase 3: XOR and hash
+        self.emit("valu", ("^", v_val, v_val, v_node_val))
+
+        for op1, val1, op2, op3, val3 in HASH_STAGES:
+            self.emit("valu", ("vbroadcast", v_const_a, self.get_const(val1)))
+            self.emit("valu", ("vbroadcast", v_const_b, self.get_const(val3)))
+            self.emit("valu", (op1, v_tmp1, v_val, v_const_a))
+            self.emit("valu", (op3, v_tmp2, v_val, v_const_b))
+            self.flush_schedule()
+            self.emit("valu", (op2, v_val, v_tmp1, v_tmp2))
+        self.flush_schedule()
+
+        # Phase 4: Compute next indices
+        self.emit("valu", ("vbroadcast", v_tmp1, two_const))
+        self.emit("valu", ("vbroadcast", v_const_a, zero_const))
+        self.flush_schedule()
+
+        self.emit("valu", ("%", v_tmp2, v_val, v_tmp1))
+        self.emit("valu", ("*", v_idx, v_idx, v_tmp1))
+        self.flush_schedule()
+
+        self.emit("valu", ("==", v_tmp2, v_tmp2, v_const_a))
+        self.emit("valu", ("vbroadcast", v_const_a, one_const))
+        self.emit("valu", ("vbroadcast", v_const_b, two_const))
+        self.flush_schedule()
+
+        self.emit("flow", ("vselect", v_tmp1, v_tmp2, v_const_a, v_const_b))
+        self.flush_schedule()
+
+        self.emit("valu", ("+", v_idx, v_idx, v_tmp1))
+        self.emit("valu", ("vbroadcast", v_tmp1, self.scratch["n_nodes"]))
+        self.flush_schedule()
+
+        # Phase 5: Wrap check
+        self.emit("valu", ("<", v_tmp2, v_idx, v_tmp1))
+        self.emit("valu", ("vbroadcast", v_tmp1, zero_const))
+        self.flush_schedule()
+
+        self.emit("flow", ("vselect", v_idx, v_tmp2, v_idx, v_tmp1))
+        self.flush_schedule()
+
+        # Phase 6: Store results
+        self.emit("alu", ("+", vec_base_addr, self.scratch["inp_indices_p"], batch_offset))
+        self.emit("alu", ("+", vec_tmp_addr, self.scratch["inp_values_p"], batch_offset))
+        self.flush_schedule()
+
+        self.emit("store", ("vstore", vec_base_addr, v_idx))
+        self.emit("store", ("vstore", vec_tmp_addr, v_val))
+        self.flush_schedule()
+
+        # ===== END LOOP BODY =====
+
+        # Update batch offset and counter
+        self.emit("alu", ("+", batch_offset, batch_offset, vlen_const))
+        self.emit("alu", ("-", batch_counter, batch_counter, one_const))
+        self.flush_schedule()
+
+        # Check if more batch chunks remain
+        self.emit("alu", ("<", loop_cond, zero_const, batch_counter))
+        self.flush_schedule()
+        self.instrs.append({"flow": [("cond_jump", loop_cond, batch_loop_start)]})
+
+        # Decrement round counter
+        self.emit("alu", ("-", round_counter, round_counter, one_const))
+        self.flush_schedule()
+
+        # Check if more rounds remain
+        self.emit("alu", ("<", loop_cond, zero_const, round_counter))
+        self.flush_schedule()
+        self.instrs.append({"flow": [("cond_jump", loop_cond, round_loop_start)]})
 
     def _emit_round_batch_loop(
         self, rounds, round_unroll, round_iters,
