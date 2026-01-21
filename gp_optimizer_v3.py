@@ -306,9 +306,10 @@ class GatherNode(GPNode):
     flush_after_addr: bool = False
     flush_per_element: bool = False
     # Extension 4: Fine-grained unrolling
-    inner_unroll: int = 1            # Unroll the per-element loop (1,2,4)
+    inner_unroll: int = 1            # Unroll the per-element loop (1,2,4,8)
     vector_grouping: int = 1         # Process N vectors together (1,2,4)
     addr_compute_ahead: int = 0      # Compute addresses N elements ahead
+    max_addr_regs: int = 2           # Address registers per chunk (1,2,4)
 
     @property
     def node_type(self) -> GPType:
@@ -327,7 +328,8 @@ class GatherNode(GPNode):
             flush_per_element=self.flush_per_element,
             inner_unroll=self.inner_unroll,
             vector_grouping=self.vector_grouping,
-            addr_compute_ahead=self.addr_compute_ahead
+            addr_compute_ahead=self.addr_compute_ahead,
+            max_addr_regs=self.max_addr_regs
         )
 
 
@@ -659,7 +661,8 @@ def random_gather() -> GatherNode:
         flush_per_element=random.choice([True, False]),
         inner_unroll=random.choice([1, 2, 4]),
         vector_grouping=random.choice([1, 2]),
-        addr_compute_ahead=random.choice([0, 1, 2])
+        addr_compute_ahead=random.choice([0, 1, 2]),
+        max_addr_regs=random.choice([2, 4])
     )
 
 
@@ -990,7 +993,7 @@ def point_mutation(tree: ProgramNode, rate: float = 0.2) -> ProgramNode:
                 node.reserve_temps = random.choice([2, 4, 8])
 
         elif isinstance(node, GatherNode):
-            choice = random.randint(0, 5)
+            choice = random.randint(0, 6)
             if choice == 0:
                 node.strategy = random.choice(list(GatherStrategy))
             elif choice == 1:
@@ -1001,8 +1004,10 @@ def point_mutation(tree: ProgramNode, rate: float = 0.2) -> ProgramNode:
                 node.inner_unroll = random.choice([1, 2, 4])
             elif choice == 4:
                 node.vector_grouping = random.choice([1, 2])
-            else:
+            elif choice == 5:
                 node.addr_compute_ahead = random.choice([0, 1, 2])
+            else:
+                node.max_addr_regs = random.choice([2, 4])
 
         elif isinstance(node, HashNode):
             choice = random.randint(0, 5)
@@ -1401,6 +1406,9 @@ class GPKernelBuilderV3:
         chunks_per_round = batch_size // (chunk_size * n_chunks)
 
         # Allocate chunk scratch based on register strategy
+        # Number of address registers per chunk is configurable via gather.max_addr_regs
+        # Minimum is 2 (needed for idx/val loads in _compile_phases and store)
+        max_addr_regs = max(2, loop.body.gather.max_addr_regs)
         chunk_scratch = []
         for c in range(n_chunks):
             p_idx = self.alloc_vector(f"p{c}_idx")
@@ -1408,9 +1416,8 @@ class GPKernelBuilderV3:
             p_node_val = self.alloc_vector(f"p{c}_node_val")
             p_tmp1 = self.alloc_vector(f"p{c}_tmp1")
             p_tmp2 = self.alloc_vector(f"p{c}_tmp2")
-            p_addr1 = self.alloc_scratch(f"p{c}_addr1")
-            p_addr2 = self.alloc_scratch(f"p{c}_addr2")
-            chunk_scratch.append((p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_addr1, p_addr2))
+            p_addrs = [self.alloc_scratch(f"p{c}_addr{i}") for i in range(max_addr_regs)]
+            chunk_scratch.append((p_idx, p_val, p_node_val, p_tmp1, p_tmp2, p_addrs))
 
         # Main iteration with optional outer unrolling
         outer_unroll = loop.outer_unroll
@@ -1428,7 +1435,7 @@ class GPKernelBuilderV3:
 
                     # Initialize indices to 0 once per chunk group (all items start at root)
                     if skip_indices:
-                        for c, (p_idx, _, _, _, _, _, _) in enumerate(chunk_scratch):
+                        for c, (p_idx, _, _, _, _, _) in enumerate(chunk_scratch):
                             self.emit("valu", ("vbroadcast", p_idx, self.get_const(0)))
                         self.flush_schedule()
 
@@ -1455,40 +1462,41 @@ class GPKernelBuilderV3:
         store_buffer_depth = memory.store_buffer_depth if memory else 0
 
         # Phase 1: Load indices and values (no phase tag - always immediate)
+        # We always use first two address registers (p_addrs[0], p_addrs[1]) for idx/val loads
         # With skip_indices=True, we don't load indices (they persist in scratch)
         if skip_indices:
             # Only load values - indices are already in scratch from init or previous round
-            for c, (p_idx, p_val, _, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
-                self.emit("load", ("const", p_addr2, batch_indices[c]))
-            for c, (p_idx, p_val, _, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
-                self.emit("alu", ("+", p_addr2, self.scratch["inp_values_p"], p_addr2))
+            for c, (p_idx, p_val, _, _, _, p_addrs) in enumerate(chunk_scratch):
+                self.emit("load", ("const", p_addrs[1], batch_indices[c]))
+            for c, (p_idx, p_val, _, _, _, p_addrs) in enumerate(chunk_scratch):
+                self.emit("alu", ("+", p_addrs[1], self.scratch["inp_values_p"], p_addrs[1]))
             self.flush_schedule()
 
-            for c, (p_idx, p_val, _, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
-                self.emit("load", ("vload", p_val, p_addr2))
+            for c, (p_idx, p_val, _, _, _, p_addrs) in enumerate(chunk_scratch):
+                self.emit("load", ("vload", p_val, p_addrs[1]))
             self.flush_schedule()
         else:
             # Original: load both indices and values
-            for c, (p_idx, p_val, _, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
-                self.emit("load", ("const", p_addr1, batch_indices[c]))
-                self.emit("load", ("const", p_addr2, batch_indices[c]))
-            for c, (p_idx, p_val, _, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
-                self.emit("alu", ("+", p_addr1, self.scratch["inp_indices_p"], p_addr1))
-                self.emit("alu", ("+", p_addr2, self.scratch["inp_values_p"], p_addr2))
+            for c, (p_idx, p_val, _, _, _, p_addrs) in enumerate(chunk_scratch):
+                self.emit("load", ("const", p_addrs[0], batch_indices[c]))
+                self.emit("load", ("const", p_addrs[1], batch_indices[c]))
+            for c, (p_idx, p_val, _, _, _, p_addrs) in enumerate(chunk_scratch):
+                self.emit("alu", ("+", p_addrs[0], self.scratch["inp_indices_p"], p_addrs[0]))
+                self.emit("alu", ("+", p_addrs[1], self.scratch["inp_values_p"], p_addrs[1]))
             self.flush_schedule()
 
             if coalesce_loads:
                 # Coalesced loads: emit all loads together before flushing
-                for c, (p_idx, p_val, _, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
-                    self.emit("load", ("vload", p_idx, p_addr1))
-                for c, (p_idx, p_val, _, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
-                    self.emit("load", ("vload", p_val, p_addr2))
+                for c, (p_idx, p_val, _, _, _, p_addrs) in enumerate(chunk_scratch):
+                    self.emit("load", ("vload", p_idx, p_addrs[0]))
+                for c, (p_idx, p_val, _, _, _, p_addrs) in enumerate(chunk_scratch):
+                    self.emit("load", ("vload", p_val, p_addrs[1]))
                 self.flush_schedule()
             else:
                 # Original: interleaved idx/val loads per chunk
-                for c, (p_idx, p_val, _, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
-                    self.emit("load", ("vload", p_idx, p_addr1))
-                    self.emit("load", ("vload", p_val, p_addr2))
+                for c, (p_idx, p_val, _, _, _, p_addrs) in enumerate(chunk_scratch):
+                    self.emit("load", ("vload", p_idx, p_addrs[0]))
+                    self.emit("load", ("vload", p_val, p_addrs[1]))
                 self.flush_schedule()
 
         # Store skip_indices for use in _compile_store
@@ -1508,7 +1516,7 @@ class GPKernelBuilderV3:
                 xor_will_be_in_hash = (seq.fusion_mode == FusionMode.GATHER_XOR and
                                        seq.hash_comp.fuse_xor_with_stage1)
                 if not xor_will_be_in_hash:
-                    for c, (p_idx, p_val, p_node_val, _, _, _, _) in enumerate(chunk_scratch):
+                    for c, (p_idx, p_val, p_node_val, _, _, _) in enumerate(chunk_scratch):
                         self.emit("valu", ("^", p_val, p_val, p_node_val))
                     self.flush_schedule()
 
@@ -1543,11 +1551,11 @@ class GPKernelBuilderV3:
 
         if gather.strategy == GatherStrategy.SEQUENTIAL:
             for vi in element_order:
-                for c, (p_idx, _, p_node_val, _, _, p_addr1, _) in enumerate(chunk_scratch):
-                    self.emit("alu", ("+", p_addr1, self.scratch["forest_values_p"], p_idx + vi), "gather")
+                for c, (p_idx, _, p_node_val, _, _, p_addrs) in enumerate(chunk_scratch):
+                    self.emit("alu", ("+", p_addrs[0], self.scratch["forest_values_p"], p_idx + vi), "gather")
                 self.flush_schedule()
-                for c, (p_idx, _, p_node_val, _, _, p_addr1, _) in enumerate(chunk_scratch):
-                    self.emit("load", ("load", p_node_val + vi, p_addr1), "gather")
+                for c, (p_idx, _, p_node_val, _, _, p_addrs) in enumerate(chunk_scratch):
+                    self.emit("load", ("load", p_node_val + vi, p_addrs[0]), "gather")
                     if (c + 1) % 2 == 0:
                         self.flush_schedule()
                 if n_chunks % 2 != 0:
@@ -1555,51 +1563,51 @@ class GPKernelBuilderV3:
 
         elif gather.strategy == GatherStrategy.DUAL_ADDR:
             for vi in range(0, VLEN, 2):
-                for c, (p_idx, _, p_node_val, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
-                    self.emit("alu", ("+", p_addr1, self.scratch["forest_values_p"], p_idx + vi), "gather")
-                    self.emit("alu", ("+", p_addr2, self.scratch["forest_values_p"], p_idx + vi + 1), "gather")
+                for c, (p_idx, _, p_node_val, _, _, p_addrs) in enumerate(chunk_scratch):
+                    self.emit("alu", ("+", p_addrs[0], self.scratch["forest_values_p"], p_idx + vi), "gather")
+                    self.emit("alu", ("+", p_addrs[1], self.scratch["forest_values_p"], p_idx + vi + 1), "gather")
                 self.flush_schedule()
-                for c, (p_idx, _, p_node_val, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
-                    self.emit("load", ("load", p_node_val + vi, p_addr1), "gather")
-                    self.emit("load", ("load", p_node_val + vi + 1, p_addr2), "gather")
+                for c, (p_idx, _, p_node_val, _, _, p_addrs) in enumerate(chunk_scratch):
+                    self.emit("load", ("load", p_node_val + vi, p_addrs[0]), "gather")
+                    self.emit("load", ("load", p_node_val + vi + 1, p_addrs[1]), "gather")
                     self.flush_schedule()
 
         elif gather.strategy in (GatherStrategy.BATCH_ADDR, GatherStrategy.PIPELINED, GatherStrategy.VECTORIZED):
-            # With inner_unroll: process 2 elements at a time using both address registers
-            # Note: inner_unroll > 2 is effectively the same as 2 due to register constraints
+            # With inner_unroll: process N elements at a time using available address registers
+            # N is limited by max_addr_regs (configurable per chunk)
             inner_unroll = gather.inner_unroll
+            max_addr_regs = gather.max_addr_regs
 
             if inner_unroll >= 2:
-                # Process 2 elements at a time using both address registers (p_addr1, p_addr2)
-                for vi_base in range(0, len(element_order), 2):
-                    vi_pair = element_order[vi_base:vi_base + 2]
+                # Process up to max_addr_regs elements at a time
+                group_size = min(inner_unroll, max_addr_regs)
+                for vi_base in range(0, len(element_order), group_size):
+                    vi_group = element_order[vi_base:vi_base + group_size]
 
-                    # Compute addresses for pair
-                    for ui, vi in enumerate(vi_pair):
-                        for c, (p_idx, _, p_node_val, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
-                            addr_reg = p_addr1 if ui == 0 else p_addr2
-                            self.emit("alu", ("+", addr_reg, self.scratch["forest_values_p"], p_idx + vi), "gather")
+                    # Compute addresses for group
+                    for ui, vi in enumerate(vi_group):
+                        for c, (p_idx, _, p_node_val, _, _, p_addrs) in enumerate(chunk_scratch):
+                            self.emit("alu", ("+", p_addrs[ui], self.scratch["forest_values_p"], p_idx + vi), "gather")
 
                     self.maybe_flush(gather.flush_after_addr)
 
-                    # Issue loads for pair - must flush before next pair's address computation
-                    for ui, vi in enumerate(vi_pair):
-                        for c, (p_idx, _, p_node_val, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
-                            addr_reg = p_addr1 if ui == 0 else p_addr2
-                            self.emit("load", ("load", p_node_val + vi, addr_reg), "gather")
+                    # Issue loads for group - must flush before next group's address computation
+                    for ui, vi in enumerate(vi_group):
+                        for c, (p_idx, _, p_node_val, _, _, p_addrs) in enumerate(chunk_scratch):
+                            self.emit("load", ("load", p_node_val + vi, p_addrs[ui]), "gather")
                     self.flush_schedule()
             else:
                 # No unrolling: original per-element processing
                 for vi in element_order:
                     # Compute addresses
-                    for c, (p_idx, _, p_node_val, _, _, p_addr1, _) in enumerate(chunk_scratch):
-                        self.emit("alu", ("+", p_addr1, self.scratch["forest_values_p"], p_idx + vi), "gather")
+                    for c, (p_idx, _, p_node_val, _, _, p_addrs) in enumerate(chunk_scratch):
+                        self.emit("alu", ("+", p_addrs[0], self.scratch["forest_values_p"], p_idx + vi), "gather")
 
                     self.maybe_flush(gather.flush_after_addr)
 
                     # Issue loads
-                    for c, (p_idx, _, p_node_val, _, _, p_addr1, _) in enumerate(chunk_scratch):
-                        self.emit("load", ("load", p_node_val + vi, p_addr1), "gather")
+                    for c, (p_idx, _, p_node_val, _, _, p_addrs) in enumerate(chunk_scratch):
+                        self.emit("load", ("load", p_node_val + vi, p_addrs[0]), "gather")
                         if (c + 1) % 2 == 0:
                             self.flush_schedule()
                     if n_chunks % 2 != 0:
@@ -1611,16 +1619,14 @@ class GPKernelBuilderV3:
         stage_unroll = hash_node.stage_unroll
         cross_chunk = hash_node.cross_chunk_interleave
 
-        # Allocate dedicated scratch for hash constants when not preloaded
-        # This avoids the bug where chunk 0's temps were used as constants AND overwritten
-        if not has_preloaded:
-            if not hasattr(self, '_hash_const_a'):
-                self._hash_const_a = self.alloc_vector("hash_const_a")
-                self._hash_const_b = self.alloc_vector("hash_const_b")
-            v_const_a = self._hash_const_a
-            v_const_b = self._hash_const_b
-        else:
-            v_const_a = v_const_b = None  # Will use vec_const_map instead
+        # Allocate dedicated scratch for hash constants
+        # These are needed as fallback even when has_preloaded=True if specific constants
+        # aren't in the map (e.g., use_preloaded_consts=True but setup didn't preload all)
+        if not hasattr(self, '_hash_const_a'):
+            self._hash_const_a = self.alloc_vector("hash_const_a")
+            self._hash_const_b = self.alloc_vector("hash_const_b")
+        v_const_a = self._hash_const_a
+        v_const_b = self._hash_const_b
 
         if cross_chunk:
             # Cross-chunk interleaving: process operations from different chunks together
@@ -1630,7 +1636,7 @@ class GPKernelBuilderV3:
 
                 # XOR fusion with first stage
                 if fuse_xor and stage_idx == 0:
-                    for c, (p_idx, p_val, p_node_val, _, _, _, _) in enumerate(chunk_scratch):
+                    for c, (p_idx, p_val, p_node_val, _, _, _) in enumerate(chunk_scratch):
                         self.emit("valu", ("^", p_val, p_val, p_node_val), "hash")
                     self.flush_schedule()
 
@@ -1638,24 +1644,24 @@ class GPKernelBuilderV3:
                     vc1 = self.vec_const_map[val1]
                     vc3 = self.vec_const_map[val3]
                     # Interleave: emit op1 for all chunks, then op3 for all chunks
-                    for c, (_, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+                    for c, (_, p_val, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                         self.emit("valu", (op1, p_tmp1, p_val, vc1), "hash")
-                    for c, (_, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+                    for c, (_, p_val, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                         self.emit("valu", (op3, p_tmp2, p_val, vc3), "hash")
                 else:
                     # Use dedicated scratch for constants (not chunk 0's temps)
                     self.emit("valu", ("vbroadcast", v_const_a, self.get_const(val1)), "hash")
                     self.emit("valu", ("vbroadcast", v_const_b, self.get_const(val3)), "hash")
                     self.flush_schedule()
-                    for c, (_, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+                    for c, (_, p_val, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                         self.emit("valu", (op1, p_tmp1, p_val, v_const_a), "hash")
-                    for c, (_, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+                    for c, (_, p_val, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                         self.emit("valu", (op3, p_tmp2, p_val, v_const_b), "hash")
 
                 self.flush_schedule()
 
                 # Final XOR for stage
-                for c, (_, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+                for c, (_, p_val, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                     self.emit("valu", (op2, p_val, p_tmp1, p_tmp2), "hash")
 
                 # Only flush if unroll factor is 1 or at unroll boundary
@@ -1673,13 +1679,13 @@ class GPKernelBuilderV3:
             for stage_idx, (op1, val1, op2, op3, val3), unroll_factor in stages_to_process:
                 # XOR fusion with first stage
                 if fuse_xor and stage_idx == 0:
-                    for c, (p_idx, p_val, p_node_val, _, _, _, _) in enumerate(chunk_scratch):
+                    for c, (p_idx, p_val, p_node_val, _, _, _) in enumerate(chunk_scratch):
                         self.emit("valu", ("^", p_val, p_val, p_node_val), "hash")
 
                 if has_preloaded and val1 in self.vec_const_map:
                     vc1 = self.vec_const_map[val1]
                     vc3 = self.vec_const_map[val3]
-                    for c, (_, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+                    for c, (_, p_val, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                         self.emit("valu", (op1, p_tmp1, p_val, vc1), "hash")
                         self.emit("valu", (op3, p_tmp2, p_val, vc3), "hash")
                 else:
@@ -1687,7 +1693,7 @@ class GPKernelBuilderV3:
                     self.emit("valu", ("vbroadcast", v_const_a, self.get_const(val1)), "hash")
                     self.emit("valu", ("vbroadcast", v_const_b, self.get_const(val3)), "hash")
                     self.flush_schedule()
-                    for c, (_, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+                    for c, (_, p_val, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                         self.emit("valu", (op1, p_tmp1, p_val, v_const_a), "hash")
                         self.emit("valu", (op3, p_tmp2, p_val, v_const_b), "hash")
 
@@ -1695,7 +1701,7 @@ class GPKernelBuilderV3:
                 if unroll_factor == 1:
                     self.flush_schedule()
 
-                for c, (_, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+                for c, (_, p_val, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                     self.emit("valu", (op2, p_val, p_tmp1, p_tmp2), "hash")
 
                 # Flush based on unroll factor - only at unroll boundaries
@@ -1730,66 +1736,66 @@ class GPKernelBuilderV3:
             # This trades more compute for potentially better ILP
 
             # Compute hash % 2 to determine branch
-            for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+            for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                 self.emit("valu", ("%", p_tmp2, p_val, vc_two), "index")
             maybe_flush_unroll(1)
 
             # Compute left child = idx * 2 + 1
-            for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+            for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                 self.emit("valu", ("*", p_tmp1, p_idx, vc_two), "index")
             maybe_flush_unroll(2)
 
-            for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+            for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                 self.emit("valu", ("+", p_tmp1, p_tmp1, vc_one), "index")  # left = idx*2+1
             maybe_flush_unroll(3)
 
             # Compute right child = idx * 2 + 2 (reuse p_idx for this)
-            for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+            for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                 self.emit("valu", ("*", p_idx, p_idx, vc_two), "index")
             maybe_flush_unroll(4)
 
-            for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+            for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                 self.emit("valu", ("+", p_idx, p_idx, vc_two), "index")  # right = idx*2+2
             maybe_flush_unroll(5)
 
             # Select based on hash: if hash%2==0 take left (tmp1), else take right (p_idx)
-            for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+            for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                 self.emit("valu", ("==", p_tmp2, p_tmp2, vc_zero), "index")
             self.flush_schedule()
 
-            for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+            for c, (p_idx, p_val, p_node_val, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                 self.emit("flow", ("vselect", p_idx, p_tmp2, p_tmp1, p_idx), "index")
             self.flush_schedule()
 
         elif index_node.strategy == IndexStrategy.VSELECT and has_preloaded:
-            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                 self.emit("valu", ("%", p_tmp2, p_val, vc_two), "index")
                 self.emit("valu", ("*", p_idx, p_idx, vc_two), "index")
             maybe_flush_unroll(1)
-            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                 self.emit("valu", ("==", p_tmp2, p_tmp2, vc_zero), "index")
             maybe_flush_unroll(2)
-            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                 self.emit("flow", ("vselect", p_tmp1, p_tmp2, vc_one, vc_two), "index")
             maybe_flush_unroll(3)
-            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                 self.emit("valu", ("+", p_idx, p_idx, p_tmp1), "index")
             self.flush_schedule()
 
         elif index_node.strategy == IndexStrategy.ARITHMETIC and has_preloaded:
-            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                 self.emit("valu", ("%", p_tmp2, p_val, vc_two), "index")
             maybe_flush_unroll(1)
-            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                 self.emit("valu", ("==", p_tmp2, p_tmp2, vc_zero), "index")
             maybe_flush_unroll(2)
-            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                 self.emit("valu", ("-", p_tmp1, vc_two, p_tmp2), "index")
             maybe_flush_unroll(3)
-            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                 self.emit("valu", ("*", p_idx, p_idx, vc_two), "index")
             maybe_flush_unroll(4)
-            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                 self.emit("valu", ("+", p_idx, p_idx, p_tmp1), "index")
             self.flush_schedule()
 
@@ -1797,78 +1803,78 @@ class GPKernelBuilderV3:
             if index_node.index_formula == "bitwise":
                 # Optimized bitwise formula: 1 + (val & 1) instead of 2 - (val % 2 == 0)
                 # This saves one VALU operation
-                for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+                for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                     self.emit("valu", ("&", p_tmp2, p_val, vc_one), "index")  # direction = val & 1
                 maybe_flush_unroll(1)
-                for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+                for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                     self.emit("valu", ("+", p_tmp1, vc_one, p_tmp2), "index")  # offset = 1 + direction
                 maybe_flush_unroll(2)
-                for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+                for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                     self.emit("valu", ("multiply_add", p_idx, p_idx, vc_two, p_tmp1), "index")  # idx = idx * 2 + offset
                 self.flush_schedule()
             else:
                 # Original formula: 2 - (val % 2 == 0)
-                for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+                for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                     self.emit("valu", ("%", p_tmp2, p_val, vc_two), "index")
                 maybe_flush_unroll(1)
-                for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+                for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                     self.emit("valu", ("==", p_tmp2, p_tmp2, vc_zero), "index")
                 maybe_flush_unroll(2)
-                for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+                for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                     self.emit("valu", ("-", p_tmp1, vc_two, p_tmp2), "index")
                 maybe_flush_unroll(3)
-                for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+                for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                     self.emit("valu", ("multiply_add", p_idx, p_idx, vc_two, p_tmp1), "index")
                 self.flush_schedule()
 
         else:
             # Fallback
-            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                 self.emit("valu", ("vbroadcast", p_tmp1, self.get_const(2)), "index")
             maybe_flush_unroll(1)
-            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                 self.emit("valu", ("%", p_tmp2, p_val, p_tmp1), "index")
                 self.emit("valu", ("*", p_idx, p_idx, p_tmp1), "index")
             maybe_flush_unroll(2)
-            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                 self.emit("valu", ("vbroadcast", p_tmp1, self.get_const(0)), "index")
             maybe_flush_unroll(3)
-            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                 self.emit("valu", ("==", p_tmp2, p_tmp2, p_tmp1), "index")
             maybe_flush_unroll(4)
-            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                 self.emit("valu", ("-", p_tmp1, p_tmp1, p_tmp2), "index")
             maybe_flush_unroll(5)
-            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                 self.emit("valu", ("+", p_idx, p_idx, p_tmp1), "index")
             self.flush_schedule()
 
         # Bounds check
         if has_n_nodes:
             vc_n = self.vec_const_map["n_nodes"]
-            for c, (p_idx, _, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+            for c, (p_idx, _, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                 self.emit("valu", ("<", p_tmp2, p_idx, vc_n), "index")
         else:
-            for c, (p_idx, _, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+            for c, (p_idx, _, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                 self.emit("valu", ("vbroadcast", p_tmp1, self.scratch["n_nodes"]), "index")
             self.flush_schedule()
-            for c, (p_idx, _, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+            for c, (p_idx, _, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                 self.emit("valu", ("<", p_tmp2, p_idx, p_tmp1), "index")
         self.flush_schedule()
 
         # Bounds application based on mode
         if index_node.bounds_check_mode == "multiply":
-            for c, (p_idx, _, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+            for c, (p_idx, _, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                 self.emit("valu", ("*", p_idx, p_idx, p_tmp2), "index")
         elif index_node.bounds_check_mode == "select":
             if has_preloaded:
-                for c, (p_idx, _, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+                for c, (p_idx, _, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                     self.emit("flow", ("vselect", p_idx, p_tmp2, p_idx, vc_zero), "index")
             else:
-                for c, (p_idx, _, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+                for c, (p_idx, _, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                     self.emit("valu", ("*", p_idx, p_idx, p_tmp2), "index")
         else:  # mask
-            for c, (p_idx, _, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+            for c, (p_idx, _, _, p_tmp1, p_tmp2, _) in enumerate(chunk_scratch):
                 self.emit("valu", ("*", p_idx, p_idx, p_tmp2), "index")
         self.flush_schedule()
 
@@ -1884,27 +1890,28 @@ class GPKernelBuilderV3:
         skip_indices = getattr(self, '_skip_indices', False)
 
         # Address computation for all chunks
+        # Store always uses first two address registers (p_addrs[0], p_addrs[1])
         if skip_indices:
             # Only compute value addresses
-            for c, (p_idx, p_val, _, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
-                self.emit("load", ("const", p_addr2, batch_indices[c]), "store")
-            for c, (p_idx, p_val, _, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
-                self.emit("alu", ("+", p_addr2, self.scratch["inp_values_p"], p_addr2), "store")
+            for c, (p_idx, p_val, _, _, _, p_addrs) in enumerate(chunk_scratch):
+                self.emit("load", ("const", p_addrs[1], batch_indices[c]), "store")
+            for c, (p_idx, p_val, _, _, _, p_addrs) in enumerate(chunk_scratch):
+                self.emit("alu", ("+", p_addrs[1], self.scratch["inp_values_p"], p_addrs[1]), "store")
             self.maybe_flush(store.flush_after_addr)
 
             # Only store values
-            for c, (p_idx, p_val, _, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
-                self.emit("store", ("vstore", p_addr2, p_val), "store")
+            for c, (p_idx, p_val, _, _, _, p_addrs) in enumerate(chunk_scratch):
+                self.emit("store", ("vstore", p_addrs[1], p_val), "store")
             self.flush_schedule()
             return
 
         # Original: compute both index and value addresses
-        for c, (p_idx, p_val, _, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
-            self.emit("load", ("const", p_addr1, batch_indices[c]), "store")
-            self.emit("load", ("const", p_addr2, batch_indices[c]), "store")
-        for c, (p_idx, p_val, _, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
-            self.emit("alu", ("+", p_addr1, self.scratch["inp_indices_p"], p_addr1), "store")
-            self.emit("alu", ("+", p_addr2, self.scratch["inp_values_p"], p_addr2), "store")
+        for c, (p_idx, p_val, _, _, _, p_addrs) in enumerate(chunk_scratch):
+            self.emit("load", ("const", p_addrs[0], batch_indices[c]), "store")
+            self.emit("load", ("const", p_addrs[1], batch_indices[c]), "store")
+        for c, (p_idx, p_val, _, _, _, p_addrs) in enumerate(chunk_scratch):
+            self.emit("alu", ("+", p_addrs[0], self.scratch["inp_indices_p"], p_addrs[0]), "store")
+            self.emit("alu", ("+", p_addrs[1], self.scratch["inp_values_p"], p_addrs[1]), "store")
         self.maybe_flush(store.flush_after_addr)
 
         # With store_buffer_depth, we delay flushing to accumulate more stores
@@ -1932,8 +1939,8 @@ class GPKernelBuilderV3:
                 for batch_start in range(0, n_chunks, batch_stores):
                     batch_end = min(batch_start + batch_stores, n_chunks)
                     for c in range(batch_start, batch_end):
-                        p_idx, p_val, _, _, _, p_addr1, p_addr2 = chunk_scratch[c]
-                        self.emit("store", ("vstore", p_addr1, p_idx), "store")
+                        p_idx, p_val, _, _, _, p_addrs = chunk_scratch[c]
+                        self.emit("store", ("vstore", p_addrs[0], p_idx), "store")
                     if write_combining:
                         # Flush after each batch when write combining to allow coalescing
                         self.flush_schedule()
@@ -1941,8 +1948,8 @@ class GPKernelBuilderV3:
                 for batch_start in range(0, n_chunks, batch_stores):
                     batch_end = min(batch_start + batch_stores, n_chunks)
                     for c in range(batch_start, batch_end):
-                        p_idx, p_val, _, _, _, p_addr1, p_addr2 = chunk_scratch[c]
-                        self.emit("store", ("vstore", p_addr2, p_val), "store")
+                        p_idx, p_val, _, _, _, p_addrs = chunk_scratch[c]
+                        self.emit("store", ("vstore", p_addrs[1], p_val), "store")
                     if write_combining:
                         self.flush_schedule()
 
@@ -1951,16 +1958,16 @@ class GPKernelBuilderV3:
                 for batch_start in range(0, n_chunks, batch_stores):
                     batch_end = min(batch_start + batch_stores, n_chunks)
                     for c in range(batch_start, batch_end):
-                        p_idx, p_val, _, _, _, p_addr1, p_addr2 = chunk_scratch[c]
-                        self.emit("store", ("vstore", p_addr2, p_val), "store")
+                        p_idx, p_val, _, _, _, p_addrs = chunk_scratch[c]
+                        self.emit("store", ("vstore", p_addrs[1], p_val), "store")
                     if write_combining:
                         self.flush_schedule()
                 # Then index stores in batches
                 for batch_start in range(0, n_chunks, batch_stores):
                     batch_end = min(batch_start + batch_stores, n_chunks)
                     for c in range(batch_start, batch_end):
-                        p_idx, p_val, _, _, _, p_addr1, p_addr2 = chunk_scratch[c]
-                        self.emit("store", ("vstore", p_addr1, p_idx), "store")
+                        p_idx, p_val, _, _, _, p_addrs = chunk_scratch[c]
+                        self.emit("store", ("vstore", p_addrs[0], p_idx), "store")
                     if write_combining:
                         self.flush_schedule()
 
@@ -1968,32 +1975,32 @@ class GPKernelBuilderV3:
                 for batch_start in range(0, n_chunks, batch_stores):
                     batch_end = min(batch_start + batch_stores, n_chunks)
                     for c in range(batch_start, batch_end):
-                        p_idx, p_val, _, _, _, p_addr1, p_addr2 = chunk_scratch[c]
-                        self.emit("store", ("vstore", p_addr1, p_idx), "store")
-                        self.emit("store", ("vstore", p_addr2, p_val), "store")
+                        p_idx, p_val, _, _, _, p_addrs = chunk_scratch[c]
+                        self.emit("store", ("vstore", p_addrs[0], p_idx), "store")
+                        self.emit("store", ("vstore", p_addrs[1], p_val), "store")
                     if write_combining:
                         self.flush_schedule()
 
         else:
             # Original store ordering without batching
             if effective_store_order == "idx_first":
-                for c, (p_idx, p_val, _, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
-                    self.emit("store", ("vstore", p_addr1, p_idx), "store")
+                for c, (p_idx, p_val, _, _, _, p_addrs) in enumerate(chunk_scratch):
+                    self.emit("store", ("vstore", p_addrs[0], p_idx), "store")
                 if write_combining:
                     self.flush_schedule()
-                for c, (p_idx, p_val, _, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
-                    self.emit("store", ("vstore", p_addr2, p_val), "store")
+                for c, (p_idx, p_val, _, _, _, p_addrs) in enumerate(chunk_scratch):
+                    self.emit("store", ("vstore", p_addrs[1], p_val), "store")
             elif effective_store_order == "val_first":
-                for c, (p_idx, p_val, _, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
-                    self.emit("store", ("vstore", p_addr2, p_val), "store")
+                for c, (p_idx, p_val, _, _, _, p_addrs) in enumerate(chunk_scratch):
+                    self.emit("store", ("vstore", p_addrs[1], p_val), "store")
                 if write_combining:
                     self.flush_schedule()
-                for c, (p_idx, p_val, _, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
-                    self.emit("store", ("vstore", p_addr1, p_idx), "store")
+                for c, (p_idx, p_val, _, _, _, p_addrs) in enumerate(chunk_scratch):
+                    self.emit("store", ("vstore", p_addrs[0], p_idx), "store")
             else:  # interleaved
-                for c, (p_idx, p_val, _, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
-                    self.emit("store", ("vstore", p_addr1, p_idx), "store")
-                    self.emit("store", ("vstore", p_addr2, p_val), "store")
+                for c, (p_idx, p_val, _, _, _, p_addrs) in enumerate(chunk_scratch):
+                    self.emit("store", ("vstore", p_addrs[0], p_idx), "store")
+                    self.emit("store", ("vstore", p_addrs[1], p_val), "store")
 
         self.flush_schedule()
 
@@ -2321,7 +2328,8 @@ class GeneticProgrammingV3:
                     'flush_per_element': node.flush_per_element,
                     'inner_unroll': node.inner_unroll,
                     'vector_grouping': node.vector_grouping,
-                    'addr_compute_ahead': node.addr_compute_ahead
+                    'addr_compute_ahead': node.addr_compute_ahead,
+                    'max_addr_regs': node.max_addr_regs
                 }
             elif isinstance(node, HashNode):
                 return {
