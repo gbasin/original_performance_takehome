@@ -387,6 +387,8 @@ class IndexNode(GPNode):
     compute_unroll: int = 1          # Unroll index computation
     bounds_check_mode: str = "multiply"  # "multiply", "select", "mask"
     speculative: bool = False        # Compute both branches speculatively
+    # Algorithmic optimization: bitwise formula uses 1+(val&1) instead of 2-(val%2==0)
+    index_formula: str = "original"  # "original" | "bitwise"
 
     @property
     def node_type(self) -> GPType:
@@ -405,7 +407,8 @@ class IndexNode(GPNode):
             use_preloaded_consts=self.use_preloaded_consts,
             compute_unroll=self.compute_unroll,
             bounds_check_mode=self.bounds_check_mode,
-            speculative=self.speculative
+            speculative=self.speculative,
+            index_formula=self.index_formula
         )
 
 
@@ -532,6 +535,9 @@ class LoopNode(GPNode):
     # Additional loop controls
     outer_unroll: int = 1            # Unroll outer loop
     chunk_unroll: int = 1            # Unroll chunk processing
+    # Algorithmic optimizations
+    loop_order: str = "round_first"  # "round_first" | "chunk_first"
+    skip_indices: bool = False       # Skip loading/storing indices (requires chunk_first)
 
     @property
     def node_type(self) -> GPType:
@@ -562,7 +568,9 @@ class LoopNode(GPNode):
             memory=self.memory.clone(),
             registers=self.registers.clone(),
             outer_unroll=self.outer_unroll,
-            chunk_unroll=self.chunk_unroll
+            chunk_unroll=self.chunk_unroll,
+            loop_order=self.loop_order,
+            skip_indices=self.skip_indices
         )
 
 
@@ -673,7 +681,8 @@ def random_index() -> IndexNode:
         use_preloaded_consts=random.choice([True, False]),
         compute_unroll=random.choice([1, 2]),
         bounds_check_mode=random.choice(["multiply", "select", "mask"]),
-        speculative=random.choice([True, False])
+        speculative=random.choice([True, False]),
+        index_formula=random.choice(["original", "bitwise"])
     )
 
 
@@ -704,16 +713,21 @@ def random_phase_sequence() -> PhaseSequenceNode:
 
 
 def random_loop() -> LoopNode:
+    loop_order = random.choice(["round_first", "chunk_first"])
+    # skip_indices only valid with chunk_first
+    skip_indices = loop_order == "chunk_first" and random.choice([True, False])
     return LoopNode(
         structure=random.choice(list(LoopStructure)),
-        parallel_chunks=random.choice([4, 8, 16]),
+        parallel_chunks=random.choice([4, 8, 16, 32]),  # Expanded to include 32
         body=random_phase_sequence(),
         pipeline=random_pipeline(),
         interleave=random_interleave(),
         memory=random_memory(),
         registers=random_register(),
         outer_unroll=random.choice([1, 2]),
-        chunk_unroll=random.choice([1, 2])
+        chunk_unroll=random.choice([1, 2]),
+        loop_order=loop_order,
+        skip_indices=skip_indices
     )
 
 
@@ -820,6 +834,29 @@ def seeded_program(seed_type: str) -> ProgramNode:
             )
         )
 
+    elif seed_type == "algorithmic":
+        # Optimal algorithmic settings discovered by hand optimization
+        return ProgramNode(
+            setup=SetupNode(True, True, True, True),
+            main_loop=LoopNode(
+                structure=LoopStructure.CHUNKED,
+                parallel_chunks=32,  # Expanded from GP's original 16 max
+                body=PhaseSequenceNode(
+                    gather=GatherNode(GatherStrategy.BATCH_ADDR, False, False),
+                    hash_comp=HashNode(HashStrategy.FUSED, False, True),
+                    index_comp=IndexNode(IndexStrategy.MULTIPLY_ADD, False, True,
+                                        index_formula="bitwise"),  # Uses 1+(val&1)
+                    store=StoreNode(False)
+                ),
+                pipeline=PipelineNode(enabled=False),
+                interleave=InterleaveNode(strategy=InterleaveStrategy.NONE),
+                memory=MemoryNode(prefetch_distance=2),
+                registers=RegisterNode(),
+                loop_order="chunk_first",  # Process all rounds per chunk
+                skip_indices=True          # Don't load/store indices
+            )
+        )
+
     else:  # baseline
         return ProgramNode(
             setup=SetupNode(True, True, True, True),
@@ -883,15 +920,24 @@ def point_mutation(tree: ProgramNode, rate: float = 0.2) -> ProgramNode:
             setattr(node, field, not getattr(node, field))
 
         elif isinstance(node, LoopNode):
-            choice = random.randint(0, 3)
+            choice = random.randint(0, 5)
             if choice == 0:
                 node.structure = random.choice(list(LoopStructure))
             elif choice == 1:
-                node.parallel_chunks = random.choice([4, 8, 16])
+                node.parallel_chunks = random.choice([4, 8, 16, 32])
             elif choice == 2:
                 node.outer_unroll = random.choice([1, 2])
-            else:
+            elif choice == 3:
                 node.chunk_unroll = random.choice([1, 2])
+            elif choice == 4:
+                node.loop_order = random.choice(["round_first", "chunk_first"])
+                # Validate: skip_indices requires chunk_first
+                if node.loop_order == "round_first":
+                    node.skip_indices = False
+            else:
+                # Only allow skip_indices=True if loop_order is chunk_first
+                if node.loop_order == "chunk_first":
+                    node.skip_indices = not node.skip_indices
 
         elif isinstance(node, PipelineNode):
             choice = random.randint(0, 3)
@@ -974,7 +1020,7 @@ def point_mutation(tree: ProgramNode, rate: float = 0.2) -> ProgramNode:
                 node.cross_chunk_interleave = not node.cross_chunk_interleave
 
         elif isinstance(node, IndexNode):
-            choice = random.randint(0, 5)
+            choice = random.randint(0, 6)
             if choice == 0:
                 node.strategy = random.choice(list(IndexStrategy))
             elif choice == 1:
@@ -985,8 +1031,10 @@ def point_mutation(tree: ProgramNode, rate: float = 0.2) -> ProgramNode:
                 node.compute_unroll = random.choice([1, 2])
             elif choice == 4:
                 node.bounds_check_mode = random.choice(["multiply", "select", "mask"])
-            else:
+            elif choice == 5:
                 node.speculative = not node.speculative
+            else:
+                node.index_formula = random.choice(["original", "bitwise"])
 
         elif isinstance(node, StoreNode):
             choice = random.randint(0, 3)
@@ -1367,45 +1415,84 @@ class GPKernelBuilderV3:
         # Main iteration with optional outer unrolling
         outer_unroll = loop.outer_unroll
 
-        for r in range(rounds):
+        # Validate: skip_indices requires chunk_first
+        skip_indices = loop.skip_indices and loop.loop_order == "chunk_first"
+
+        if loop.loop_order == "chunk_first":
+            # CHUNK_FIRST: Process each chunk group through ALL rounds
+            # This allows indices to persist in scratch across rounds
             for cg in range(0, chunks_per_round, outer_unroll):
                 for u in range(min(outer_unroll, chunks_per_round - cg)):
                     batch_indices = [(cg + u) * n_chunks * chunk_size + c * chunk_size
                                     for c in range(n_chunks)]
 
-                    self._compile_phases(loop.body, chunk_scratch, batch_indices, loop)
+                    # Initialize indices to 0 once per chunk group (all items start at root)
+                    if skip_indices:
+                        for c, (p_idx, _, _, _, _, _, _) in enumerate(chunk_scratch):
+                            self.emit("valu", ("vbroadcast", p_idx, self.get_const(0)))
+                        self.flush_schedule()
 
-    def _compile_phases(self, seq: PhaseSequenceNode, chunk_scratch, batch_indices, loop: LoopNode):
-        n_chunks = len(chunk_scratch)
+                    # Process all rounds for this chunk group
+                    for r in range(rounds):
+                        self._compile_phases(loop.body, chunk_scratch, batch_indices, loop,
+                                           skip_indices=skip_indices)
+        else:
+            # ROUND_FIRST (original): Process all chunks per round
+            for r in range(rounds):
+                for cg in range(0, chunks_per_round, outer_unroll):
+                    for u in range(min(outer_unroll, chunks_per_round - cg)):
+                        batch_indices = [(cg + u) * n_chunks * chunk_size + c * chunk_size
+                                        for c in range(n_chunks)]
+
+                        self._compile_phases(loop.body, chunk_scratch, batch_indices, loop,
+                                           skip_indices=False)
+
+    def _compile_phases(self, seq: PhaseSequenceNode, chunk_scratch, batch_indices, loop: LoopNode,
+                        skip_indices: bool = False):
         interleave = loop.interleave
         memory = loop.memory
         coalesce_loads = memory.coalesce_loads if memory else False
         store_buffer_depth = memory.store_buffer_depth if memory else 0
 
         # Phase 1: Load indices and values (no phase tag - always immediate)
-        # With coalesce_loads, we try to group loads more aggressively
-        for c, (p_idx, p_val, _, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
-            self.emit("load", ("const", p_addr1, batch_indices[c]))
-            self.emit("load", ("const", p_addr2, batch_indices[c]))
-        for c, (p_idx, p_val, _, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
-            self.emit("alu", ("+", p_addr1, self.scratch["inp_indices_p"], p_addr1))
-            self.emit("alu", ("+", p_addr2, self.scratch["inp_values_p"], p_addr2))
-        self.flush_schedule()
-
-        if coalesce_loads:
-            # Coalesced loads: emit all loads together before flushing
-            # This allows the scheduler to group adjacent memory accesses
+        # With skip_indices=True, we don't load indices (they persist in scratch)
+        if skip_indices:
+            # Only load values - indices are already in scratch from init or previous round
             for c, (p_idx, p_val, _, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
-                self.emit("load", ("vload", p_idx, p_addr1))
+                self.emit("load", ("const", p_addr2, batch_indices[c]))
+            for c, (p_idx, p_val, _, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
+                self.emit("alu", ("+", p_addr2, self.scratch["inp_values_p"], p_addr2))
+            self.flush_schedule()
+
             for c, (p_idx, p_val, _, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
                 self.emit("load", ("vload", p_val, p_addr2))
             self.flush_schedule()
         else:
-            # Original: interleaved idx/val loads per chunk
+            # Original: load both indices and values
             for c, (p_idx, p_val, _, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
-                self.emit("load", ("vload", p_idx, p_addr1))
-                self.emit("load", ("vload", p_val, p_addr2))
+                self.emit("load", ("const", p_addr1, batch_indices[c]))
+                self.emit("load", ("const", p_addr2, batch_indices[c]))
+            for c, (p_idx, p_val, _, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
+                self.emit("alu", ("+", p_addr1, self.scratch["inp_indices_p"], p_addr1))
+                self.emit("alu", ("+", p_addr2, self.scratch["inp_values_p"], p_addr2))
             self.flush_schedule()
+
+            if coalesce_loads:
+                # Coalesced loads: emit all loads together before flushing
+                for c, (p_idx, p_val, _, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
+                    self.emit("load", ("vload", p_idx, p_addr1))
+                for c, (p_idx, p_val, _, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
+                    self.emit("load", ("vload", p_val, p_addr2))
+                self.flush_schedule()
+            else:
+                # Original: interleaved idx/val loads per chunk
+                for c, (p_idx, p_val, _, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
+                    self.emit("load", ("vload", p_idx, p_addr1))
+                    self.emit("load", ("vload", p_val, p_addr2))
+                self.flush_schedule()
+
+        # Store skip_indices for use in _compile_store
+        self._skip_indices = skip_indices
 
         # Track pending stores for store_buffer_depth
         self._store_buffer_depth = store_buffer_depth
@@ -1707,18 +1794,32 @@ class GPKernelBuilderV3:
             self.flush_schedule()
 
         elif index_node.strategy in (IndexStrategy.MULTIPLY_ADD, IndexStrategy.BRANCHLESS) and has_preloaded:
-            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
-                self.emit("valu", ("%", p_tmp2, p_val, vc_two), "index")
-            maybe_flush_unroll(1)
-            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
-                self.emit("valu", ("==", p_tmp2, p_tmp2, vc_zero), "index")
-            maybe_flush_unroll(2)
-            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
-                self.emit("valu", ("-", p_tmp1, vc_two, p_tmp2), "index")
-            maybe_flush_unroll(3)
-            for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
-                self.emit("valu", ("multiply_add", p_idx, p_idx, vc_two, p_tmp1), "index")
-            self.flush_schedule()
+            if index_node.index_formula == "bitwise":
+                # Optimized bitwise formula: 1 + (val & 1) instead of 2 - (val % 2 == 0)
+                # This saves one VALU operation
+                for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+                    self.emit("valu", ("&", p_tmp2, p_val, vc_one), "index")  # direction = val & 1
+                maybe_flush_unroll(1)
+                for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+                    self.emit("valu", ("+", p_tmp1, vc_one, p_tmp2), "index")  # offset = 1 + direction
+                maybe_flush_unroll(2)
+                for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+                    self.emit("valu", ("multiply_add", p_idx, p_idx, vc_two, p_tmp1), "index")  # idx = idx * 2 + offset
+                self.flush_schedule()
+            else:
+                # Original formula: 2 - (val % 2 == 0)
+                for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+                    self.emit("valu", ("%", p_tmp2, p_val, vc_two), "index")
+                maybe_flush_unroll(1)
+                for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+                    self.emit("valu", ("==", p_tmp2, p_tmp2, vc_zero), "index")
+                maybe_flush_unroll(2)
+                for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+                    self.emit("valu", ("-", p_tmp1, vc_two, p_tmp2), "index")
+                maybe_flush_unroll(3)
+                for c, (p_idx, p_val, _, p_tmp1, p_tmp2, _, _) in enumerate(chunk_scratch):
+                    self.emit("valu", ("multiply_add", p_idx, p_idx, vc_two, p_tmp1), "index")
+                self.flush_schedule()
 
         else:
             # Fallback
@@ -1779,7 +1880,25 @@ class GPKernelBuilderV3:
         coalesce_stores = memory.coalesce_stores if memory else False
         store_buffer_depth = memory.store_buffer_depth if memory else 0
 
+        # Check if we should skip storing indices
+        skip_indices = getattr(self, '_skip_indices', False)
+
         # Address computation for all chunks
+        if skip_indices:
+            # Only compute value addresses
+            for c, (p_idx, p_val, _, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
+                self.emit("load", ("const", p_addr2, batch_indices[c]), "store")
+            for c, (p_idx, p_val, _, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
+                self.emit("alu", ("+", p_addr2, self.scratch["inp_values_p"], p_addr2), "store")
+            self.maybe_flush(store.flush_after_addr)
+
+            # Only store values
+            for c, (p_idx, p_val, _, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
+                self.emit("store", ("vstore", p_addr2, p_val), "store")
+            self.flush_schedule()
+            return
+
+        # Original: compute both index and value addresses
         for c, (p_idx, p_val, _, _, _, p_addr1, p_addr2) in enumerate(chunk_scratch):
             self.emit("load", ("const", p_addr1, batch_indices[c]), "store")
             self.emit("load", ("const", p_addr2, batch_indices[c]), "store")
@@ -1994,9 +2113,9 @@ class GeneticProgrammingV3:
     def initialize_population(self):
         self.population = []
 
-        # Seed with different strategies
+        # Seed with different strategies (including algorithmic optimizations)
         for seed_type in ["baseline", "minimal_flush", "max_interleave",
-                          "pipelined", "memory_optimized"]:
+                          "pipelined", "memory_optimized", "algorithmic"]:
             self.population.append(seeded_program(seed_type))
 
         # Fill with random
@@ -2109,9 +2228,10 @@ class GeneticProgrammingV3:
             loop = self.best_program.main_loop
             phases = loop.body
             print(f"Structure: {loop.structure.value}, chunks={loop.parallel_chunks}")
+            print(f"  Loop order: {loop.loop_order}, skip_indices={loop.skip_indices}")
             print(f"  Gather: {phases.gather.strategy.value}")
             print(f"  Hash: {phases.hash_comp.strategy.value}")
-            print(f"  Index: {phases.index_comp.strategy.value}")
+            print(f"  Index: {phases.index_comp.strategy.value}, formula={phases.index_comp.index_formula}")
             print(f"  Interleave: {loop.interleave.strategy.value}")
             print(f"  Pipeline: enabled={loop.pipeline.enabled}, depth={loop.pipeline.pipeline_depth}")
             print(f"  Memory: prefetch={loop.memory.prefetch_distance}, addr_gen={loop.memory.address_gen.value}")
