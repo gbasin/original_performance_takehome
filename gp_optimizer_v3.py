@@ -310,6 +310,8 @@ class GatherNode(GPNode):
     vector_grouping: int = 1         # Process N vectors together (1,2,4)
     addr_compute_ahead: int = 0      # Compute addresses N elements ahead
     max_addr_regs: int = 2           # Address registers per chunk (1,2,4)
+    # Tree cache: use preloaded top-of-tree nodes instead of gathering
+    use_tree_cache: bool = True      # Use cached nodes when available for early rounds
 
     @property
     def node_type(self) -> GPType:
@@ -329,7 +331,8 @@ class GatherNode(GPNode):
             inner_unroll=self.inner_unroll,
             vector_grouping=self.vector_grouping,
             addr_compute_ahead=self.addr_compute_ahead,
-            max_addr_regs=self.max_addr_regs
+            max_addr_regs=self.max_addr_regs,
+            use_tree_cache=self.use_tree_cache
         )
 
 
@@ -452,6 +455,10 @@ class SetupNode(GPNode):
     preload_vectors: bool = True
     preload_hash_consts: bool = True
     preload_n_nodes: bool = True
+    # Tree cache: preload top-of-tree nodes to avoid gathers for early rounds
+    # 0 = disabled, 1 = cache depth 0 (1 node), 2 = cache depths 0-1 (3 nodes),
+    # 3 = cache depths 0-2 (7 nodes), etc.  Total nodes = 2^tree_cache_depth - 1
+    tree_cache_depth: int = 0
 
     @property
     def node_type(self) -> GPType:
@@ -468,7 +475,8 @@ class SetupNode(GPNode):
             preload_scalars=self.preload_scalars,
             preload_vectors=self.preload_vectors,
             preload_hash_consts=self.preload_hash_consts,
-            preload_n_nodes=self.preload_n_nodes
+            preload_n_nodes=self.preload_n_nodes,
+            tree_cache_depth=self.tree_cache_depth
         )
 
 
@@ -650,7 +658,8 @@ def random_setup() -> SetupNode:
         preload_scalars=random.choice([True, False]),
         preload_vectors=random.choice([True, False]),
         preload_hash_consts=random.choice([True, False]),
-        preload_n_nodes=random.choice([True, False])
+        preload_n_nodes=random.choice([True, False]),
+        tree_cache_depth=random.choice([0, 0, 1, 2, 3])  # 0 disabled, 1-3 cache levels
     )
 
 
@@ -662,7 +671,8 @@ def random_gather() -> GatherNode:
         inner_unroll=random.choice([1, 2, 4]),
         vector_grouping=random.choice([1, 2]),
         addr_compute_ahead=random.choice([0, 1, 2]),
-        max_addr_regs=random.choice([2, 4])
+        max_addr_regs=random.choice([2, 4]),
+        use_tree_cache=random.choice([True, True, False])  # Biased toward enabled
     )
 
 
@@ -918,9 +928,14 @@ def point_mutation(tree: ProgramNode, rate: float = 0.2) -> ProgramNode:
             continue
 
         if isinstance(node, SetupNode):
-            field = random.choice(['preload_scalars', 'preload_vectors',
-                                   'preload_hash_consts', 'preload_n_nodes'])
-            setattr(node, field, not getattr(node, field))
+            choice = random.randint(0, 4)
+            if choice < 4:
+                field = ['preload_scalars', 'preload_vectors',
+                         'preload_hash_consts', 'preload_n_nodes'][choice]
+                setattr(node, field, not getattr(node, field))
+            else:
+                # Mutate tree_cache_depth (0=disabled, 1-3=cache levels)
+                node.tree_cache_depth = random.choice([0, 1, 2, 3])
 
         elif isinstance(node, LoopNode):
             choice = random.randint(0, 5)
@@ -993,7 +1008,7 @@ def point_mutation(tree: ProgramNode, rate: float = 0.2) -> ProgramNode:
                 node.reserve_temps = random.choice([2, 4, 8])
 
         elif isinstance(node, GatherNode):
-            choice = random.randint(0, 6)
+            choice = random.randint(0, 7)
             if choice == 0:
                 node.strategy = random.choice(list(GatherStrategy))
             elif choice == 1:
@@ -1006,8 +1021,10 @@ def point_mutation(tree: ProgramNode, rate: float = 0.2) -> ProgramNode:
                 node.vector_grouping = random.choice([1, 2])
             elif choice == 5:
                 node.addr_compute_ahead = random.choice([0, 1, 2])
-            else:
+            elif choice == 6:
                 node.max_addr_regs = random.choice([2, 4])
+            else:
+                node.use_tree_cache = not node.use_tree_cache
 
         elif isinstance(node, HashNode):
             choice = random.randint(0, 5)
@@ -1112,6 +1129,14 @@ class GPKernelBuilderV3:
         # Track interleaving state
         self.interleave_buffer: List[Tuple[str, tuple, str]] = []  # (engine, slot, phase)
         self.current_phase: str = ""
+
+        # Tree cache: preloaded top-of-tree node values (depth -> node_idx -> vector addr)
+        self.tree_cache: dict = {}  # node_idx -> vector register address
+        self.tree_cache_depth: int = 0  # How many levels are cached
+
+        # Round tracking for tree cache optimization
+        self.current_round: int = 0
+        self.skip_indices_mode: bool = False  # True when all elements start at root
 
     def debug_info(self) -> DebugInfo:
         return DebugInfo(scratch_map=self.scratch_debug)
@@ -1400,6 +1425,36 @@ class GPKernelBuilderV3:
 
             self.flush_schedule()
 
+        # Tree cache: preload top-of-tree nodes into vector registers
+        # tree_cache_depth=2 caches depths 0-1 (nodes 0,1,2 = 3 nodes)
+        # tree_cache_depth=3 caches depths 0-2 (nodes 0-6 = 7 nodes)
+        # Total nodes for depth d: 2^d - 1
+        if setup.tree_cache_depth > 0:
+            self.tree_cache_depth = setup.tree_cache_depth
+            n_cached_nodes = (1 << setup.tree_cache_depth) - 1  # 2^depth - 1
+
+            # Allocate a temp scalar for address computation
+            tmp_addr = self.alloc_scratch("tree_cache_tmp_addr")
+
+            for node_idx in range(n_cached_nodes):
+                # Allocate vector register for this cached node
+                v_addr = self.alloc_vector(f"tree_cache_{node_idx}")
+                self.tree_cache[node_idx] = v_addr
+
+                # Load: addr = forest_values_p + node_idx
+                self.emit("alu", ("+", tmp_addr, self.scratch["forest_values_p"], self.get_const(node_idx)), "setup")
+                self.flush_schedule()
+
+                # Load scalar value from memory
+                tmp_val = self.alloc_scratch(f"tree_cache_val_{node_idx}")
+                self.emit("load", ("load", tmp_val, tmp_addr), "setup")
+                self.flush_schedule()
+
+                # Broadcast to vector register
+                self.emit("valu", ("vbroadcast", v_addr, tmp_val), "setup")
+
+            self.flush_schedule()
+
     def _compile_loop(self, loop: LoopNode, batch_size: int, rounds: int):
         n_chunks = loop.parallel_chunks
         chunk_size = VLEN
@@ -1428,6 +1483,7 @@ class GPKernelBuilderV3:
         if loop.loop_order == "chunk_first":
             # CHUNK_FIRST: Process each chunk group through ALL rounds
             # This allows indices to persist in scratch across rounds
+            self.skip_indices_mode = skip_indices  # Track for tree cache optimization
             for cg in range(0, chunks_per_round, outer_unroll):
                 for u in range(min(outer_unroll, chunks_per_round - cg)):
                     batch_indices = [(cg + u) * n_chunks * chunk_size + c * chunk_size
@@ -1441,11 +1497,14 @@ class GPKernelBuilderV3:
 
                     # Process all rounds for this chunk group
                     for r in range(rounds):
+                        self.current_round = r
                         self._compile_phases(loop.body, chunk_scratch, batch_indices, loop,
                                            skip_indices=skip_indices)
         else:
             # ROUND_FIRST (original): Process all chunks per round
+            self.skip_indices_mode = False
             for r in range(rounds):
+                self.current_round = r
                 for cg in range(0, chunks_per_round, outer_unroll):
                     for u in range(min(outer_unroll, chunks_per_round - cg)):
                         batch_indices = [(cg + u) * n_chunks * chunk_size + c * chunk_size
@@ -1536,6 +1595,43 @@ class GPKernelBuilderV3:
     def _compile_gather(self, gather: GatherNode, chunk_scratch, interleave: InterleaveNode,
                         memory: Optional[MemoryNode] = None):
         n_chunks = len(chunk_scratch)
+
+        # Tree cache optimization: use preloaded node values for early rounds
+        # Only works with skip_indices_mode (all elements start at root)
+        if (gather.use_tree_cache and self.tree_cache_depth > 0 and
+                self.skip_indices_mode and self.current_round < self.tree_cache_depth):
+
+            if self.current_round == 0:
+                # Round 0: All elements at node 0 (root)
+                # Just copy the cached root value to p_node_val
+                # Use OR with itself as identity copy (no vmov instruction)
+                cached_root = self.tree_cache[0]
+                for c, (p_idx, p_val, p_node_val, _, _, _) in enumerate(chunk_scratch):
+                    # Vector copy via identity: p_node_val = cached_root | cached_root
+                    self.emit("valu", ("|", p_node_val, cached_root, cached_root), "gather")
+                self.flush_schedule()
+                return
+
+            elif self.current_round == 1 and self.tree_cache_depth >= 2:
+                # Round 1: Elements at node 1 or 2 based on previous hash
+                # p_idx is either 1 or 2 for each element
+                # Use vselect: if (p_idx & 1) then tree_cache[1] else tree_cache[2]
+                # Note: node 1 = 0b01, node 2 = 0b10, so (idx & 1) distinguishes them
+                cached_node1 = self.tree_cache[1]
+                cached_node2 = self.tree_cache[2]
+                vc_one = self.vec_const_map.get(1)
+
+                if vc_one is not None:
+                    for c, (p_idx, p_val, p_node_val, p_tmp1, _, _) in enumerate(chunk_scratch):
+                        # p_tmp1 = p_idx & 1 (1 if node 1, 0 if node 2)
+                        self.emit("valu", ("&", p_tmp1, p_idx, vc_one), "gather")
+                    self.flush_schedule()
+                    for c, (p_idx, p_val, p_node_val, p_tmp1, _, _) in enumerate(chunk_scratch):
+                        # p_node_val = select(p_tmp1, cached_node1, cached_node2)
+                        self.emit("flow", ("vselect", p_node_val, p_tmp1, cached_node1, cached_node2), "gather")
+                    self.flush_schedule()
+                    return
+                # Fall through to normal gather if constants not preloaded
 
         # Determine element order based on memory access_order setting
         if memory is not None and memory.access_order == AccessOrder.REVERSED:
@@ -2259,7 +2355,8 @@ class GeneticProgrammingV3:
                     'preload_scalars': node.preload_scalars,
                     'preload_vectors': node.preload_vectors,
                     'preload_hash_consts': node.preload_hash_consts,
-                    'preload_n_nodes': node.preload_n_nodes
+                    'preload_n_nodes': node.preload_n_nodes,
+                    'tree_cache_depth': node.tree_cache_depth
                 }
             elif isinstance(node, LoopNode):
                 return {
@@ -2329,7 +2426,8 @@ class GeneticProgrammingV3:
                     'inner_unroll': node.inner_unroll,
                     'vector_grouping': node.vector_grouping,
                     'addr_compute_ahead': node.addr_compute_ahead,
-                    'max_addr_regs': node.max_addr_regs
+                    'max_addr_regs': node.max_addr_regs,
+                    'use_tree_cache': node.use_tree_cache
                 }
             elif isinstance(node, HashNode):
                 return {
