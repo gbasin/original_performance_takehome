@@ -3002,9 +3002,9 @@ class GeneticProgrammingV3:
         self.population = new_population
 
     def run(self, verbose: bool = True) -> Tuple[ProgramNode, float]:
-        print(f"Starting GP V3: {self.population_size} individuals, {self.generations} generations")
-        print(f"Extensions: Pipeline, Interleave, Memory, Unroll, Register, Phase Fusion")
-        print()
+        print(f"Starting GP V3: {self.population_size} individuals, {self.generations} generations", flush=True)
+        print(f"Extensions: Pipeline, Interleave, Memory, Unroll, Register, Phase Fusion", flush=True)
+        print(flush=True)
 
         self.initialize_population()
 
@@ -3035,7 +3035,7 @@ class GeneticProgrammingV3:
                       f"gen_best={gen_best:,.0f}, gen_avg={avg:,.0f}, "
                       f"valid={len(valid)}/{self.population_size}, "
                       f"unique={len(signatures)}, "
-                      f"time={time.time()-start:.1f}s")
+                      f"time={time.time()-start:.1f}s", flush=True)
 
             if self.best_fitness < 1500:
                 print(f"\nExcellent solution found!")
