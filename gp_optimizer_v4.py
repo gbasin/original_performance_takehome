@@ -43,6 +43,7 @@ from problem import (
     Input,
     build_mem_image,
     reference_kernel2,
+    Machine,
 )
 
 
@@ -610,6 +611,7 @@ class LoopNode(GPNode):
     gather_load_mode: GatherLoadMode = GatherLoadMode.VLOAD
     batch_reg_layout: BatchRegisterLayout = BatchRegisterLayout.DYNAMIC
     wave_scheduling: WaveScheduling = WaveScheduling.PHASE_FLUSH
+    gen_yield_batch: int = 1          # Generator yield batch size (1=per op, higher=batch more)
 
     @property
     def node_type(self) -> GPType:
@@ -651,7 +653,8 @@ class LoopNode(GPNode):
             generator_emission=self.generator_emission,
             gather_load_mode=self.gather_load_mode,
             batch_reg_layout=self.batch_reg_layout,
-            wave_scheduling=self.wave_scheduling
+            wave_scheduling=self.wave_scheduling,
+            gen_yield_batch=self.gen_yield_batch
         )
 
 
@@ -686,7 +689,8 @@ class ProgramNode(GPNode):
 
 def random_pipeline() -> PipelineNode:
     return PipelineNode(
-        enabled=random.choice([True, False]),
+        # FIXED: enabled=True causes failures with various loop combinations
+        enabled=False,
         pipeline_depth=random.choice([1, 2, 3]),
         # NOTE: GATHER_FIRST, BALANCED, STORE_LAST are broken due to data dependencies
         # Only NONE produces correct output
@@ -719,10 +723,13 @@ def random_memory() -> MemoryNode:
 
 def random_register() -> RegisterNode:
     return RegisterNode(
-        allocation=random.choice(list(AllocationStrategy)),
+        # FIXED: SPARSE allocation causes register exhaustion with parallel_chunks=32
+        # Only use DENSE and PHASED allocation strategies
+        allocation=random.choice([AllocationStrategy.DENSE, AllocationStrategy.PHASED]),
         reuse_policy=random.choice(list(ReusePolicy)),
         spill_threshold=random.choice([256, 512, 768]),
-        vector_alignment=random.choice([8, 16]),
+        # FIXED: vector_alignment=16 causes issues with parallel_chunks=32
+        vector_alignment=8,
         reserve_temps=random.choice([0, 0, 2, 4])  # Reduced to avoid scratch exhaustion
     )
 
@@ -730,10 +737,13 @@ def random_register() -> RegisterNode:
 def random_setup() -> SetupNode:
     return SetupNode(
         preload_scalars=random.choice([True, False]),
-        preload_vectors=random.choice([True, False]),
+        # FIXED: preload_vectors=False is broken - vector preload code path has bugs
+        preload_vectors=True,
+        # Safe now that HashStrategy.UNROLLED is excluded from random_hash()
         preload_hash_consts=random.choice([True, False]),
         preload_n_nodes=random.choice([True, False]),
-        tree_cache_depth=random.choice([0, 0, 1, 2, 3])  # 0 disabled, 1-3 cache levels
+        # FIXED: tree_cache_depth >= 2 causes scratch exhaustion with parallel_chunks=32
+        tree_cache_depth=random.choice([0, 0, 1])  # 0 disabled, 1 = one cache level
     )
 
 
@@ -745,16 +755,20 @@ def random_gather() -> GatherNode:
         inner_unroll=random.choice([1, 2, 4]),
         vector_grouping=random.choice([1, 2]),
         addr_compute_ahead=random.choice([0, 1, 2]),
-        max_addr_regs=random.choice([2, 4]),
+        # FIXED: max_addr_regs=4 causes register exhaustion with parallel_chunks=32
+        max_addr_regs=2,
         use_tree_cache=random.choice([True, True, False])  # Biased toward enabled
     )
 
 
 def random_hash() -> HashNode:
+    # FIXED: HashStrategy.UNROLLED is broken with tile_size > 0 (causes inf cycles)
+    # Exclude it since other strategies perform equally well or better
+    safe_strategies = [HashStrategy.STANDARD, HashStrategy.FUSED, HashStrategy.INTERLEAVED]
     return HashNode(
-        strategy=random.choice(list(HashStrategy)),
+        strategy=random.choice(safe_strategies),
         flush_per_stage=random.choice([True, False]),
-        use_preloaded_consts=random.choice([True, False]),
+        use_preloaded_consts=random.choice([True, False]),  # Safe now that UNROLLED is excluded
         stage_unroll=tuple(random.choice([1, 2]) for _ in range(4)),
         fuse_xor_with_stage1=random.choice([True, False]),
         cross_chunk_interleave=random.choice([True, False])
@@ -765,7 +779,9 @@ def random_index() -> IndexNode:
     return IndexNode(
         strategy=random.choice(list(IndexStrategy)),
         flush_per_op=random.choice([True, False]),
-        use_preloaded_consts=random.choice([True, False]),
+        # FIXED: use_preloaded_consts=False is broken - fallback code path has bugs
+        # Always use preloaded constants for correctness
+        use_preloaded_consts=True,
         compute_unroll=random.choice([1, 2]),
         bounds_check_mode=random.choice(["multiply", "select", "mask"]),
         speculative=random.choice([True, False]),
@@ -783,9 +799,10 @@ def random_store() -> StoreNode:
 
 
 def random_phase_sequence() -> PhaseSequenceNode:
+    # FIXED: Only one valid phase order - hash must come before index
+    # because the index computation depends on the hash result
     phase_orders = [
         ["gather", "hash", "index", "store"],
-        ["gather", "index", "hash", "store"],
     ]
     # Exclude HASH_INDEX and INDEX_STORE fusion modes (not fully implemented)
     # FULL mode also excluded as it depends on other fusion modes
@@ -816,12 +833,6 @@ def random_loop() -> LoopNode:
     # Wave size: 0 = disabled, 8/16/32 = wave-based execution
     # Higher wave sizes allow more latency hiding but require more registers
     wave_size = random.choice([0, 0, 0, 8, 16])  # Mostly disabled, sometimes try wave-based
-    scheduler_type = random.choice([
-        SchedulerType.GREEDY,  # Default
-        SchedulerType.GREEDY,  # Favor greedy
-        SchedulerType.TIME_BASED,
-        SchedulerType.WAVE_INTERLEAVED
-    ])
     memory_layout = random.choice([MemoryLayout.FLAT, MemoryLayout.FLAT, MemoryLayout.SEGMENTED])
     bulk_load = random.choice([False, False, True])  # Mostly disabled
 
@@ -849,11 +860,26 @@ def random_loop() -> LoopNode:
             WaveScheduling.ROUND_ROBIN,  # Favor round-robin
             WaveScheduling.PHASE_FLUSH
         ])
+        # Generator yield batching: 1=per op, 2-4=batch more ops together
+        gen_yield_batch = random.choice([1, 1, 2, 3, 4])
+        # IMPORTANT: When using wave_size > 0 with generator emission, must use GREEDY scheduler
+        # Non-GREEDY schedulers (TIME_BASED, WAVE_INTERLEAVED) go through _compile_loop_wave_based
+        # which doesn't correctly handle all loop parameter combinations (structure, tile_size, etc.)
+        # The generator path has its own SmartScheduler, so GREEDY here just routes correctly
+        scheduler_type = SchedulerType.GREEDY
     else:
         generator_emission = GeneratorEmission.PHASE_BASED
         gather_load_mode = random.choice(list(GatherLoadMode))
         batch_reg_layout = BatchRegisterLayout.DYNAMIC
         wave_scheduling = WaveScheduling.PHASE_FLUSH
+        gen_yield_batch = 1  # Not used for non-generator mode
+        # When wave_size=0, can use any scheduler safely
+        scheduler_type = random.choice([
+            SchedulerType.GREEDY,
+            SchedulerType.GREEDY,  # Favor greedy
+            SchedulerType.TIME_BASED,
+            SchedulerType.WAVE_INTERLEAVED
+        ])
 
     return LoopNode(
         structure=random.choice(list(LoopStructure)),
@@ -875,7 +901,8 @@ def random_loop() -> LoopNode:
         generator_emission=generator_emission,
         gather_load_mode=gather_load_mode,
         batch_reg_layout=batch_reg_layout,
-        wave_scheduling=wave_scheduling
+        wave_scheduling=wave_scheduling,
+        gen_yield_batch=gen_yield_batch
     )
 
 
@@ -1110,15 +1137,24 @@ def point_mutation(tree: ProgramNode, rate: float = 0.2) -> ProgramNode:
         elif isinstance(node, LoopNode):
             # FORCED: Keep loop_order=chunk_first and skip_indices=True
             # Only mutate other parameters
-            choice = random.randint(0, 3)
+            choice = random.randint(0, 7)
             if choice == 0:
                 node.structure = random.choice(list(LoopStructure))
             elif choice == 1:
                 node.parallel_chunks = random.choice([8, 16, 32])
             elif choice == 2:
                 node.outer_unroll = random.choice([1, 2])
-            else:
+            elif choice == 3:
                 node.chunk_unroll = random.choice([1, 2])
+            elif choice == 4:
+                node.wave_size = random.choice([0, 8, 16])
+            elif choice == 5:
+                node.scheduler_type = random.choice(list(SchedulerType))
+            elif choice == 6:
+                # Generator yield batch size (only relevant when wave_size > 0)
+                node.gen_yield_batch = random.choice([1, 2, 3, 4])
+            else:
+                node.generator_emission = random.choice(list(GeneratorEmission))
             # Ensure skip_indices stays enabled
             node.loop_order = "chunk_first"
             node.skip_indices = True
@@ -2332,7 +2368,12 @@ class GPKernelBuilderV4:
                     batch_offset, rounds, hash_const_vecs,
                     forest_values_p, two_vec, zero_vec, one_vec, n_nodes_vec,
                     t_base, loop.gather_load_mode,
-                    GEN_IDX_BASE, GEN_VAL_BASE
+                    GEN_IDX_BASE, GEN_VAL_BASE,
+                    index_formula=loop.body.index_comp.index_formula,
+                    fuse_hash_ops=loop.body.hash_comp.fuse_xor_with_stage1,
+                    flush_per_stage=loop.body.hash_comp.flush_per_stage,
+                    yield_batch_size=loop.gen_yield_batch,
+                    bounds_check_mode=loop.body.index_comp.bounds_check_mode
                 )
                 wave_generators.append((b_idx, gen))
                 # Only initialize batch_times for first wave (wave 0)
@@ -2397,7 +2438,12 @@ class GPKernelBuilderV4:
                                forest_base: int, two_vec: int, zero_vec: int,
                                one_vec: int, n_nodes_vec: int, t_base: int,
                                gather_load_mode: GatherLoadMode,
-                               idx_base: int, val_base: int):
+                               idx_base: int, val_base: int,
+                               index_formula: str = "multiply_add",
+                               fuse_hash_ops: bool = False,
+                               flush_per_stage: bool = False,
+                               yield_batch_size: int = 1,
+                               bounds_check_mode: str = "select"):
         """Generator that yields operation batches for one batch through all rounds.
 
         Fixed 32-register layout per batch:
@@ -2405,6 +2451,13 @@ class GPKernelBuilderV4:
         - T_ADDR_VEC = t_base + 8  (8 regs) - address registers
         - T_TMP1 = t_base + 16     (8 regs) - temporary 1
         - T_TMP2 = t_base + 24     (8 regs) - temporary 2
+
+        Parameters from GP:
+        - index_formula: "multiply_add" or "bitwise" - how to compute next index
+        - fuse_hash_ops: if True, yield ALL hash ops together (max batching)
+        - flush_per_stage: if True and not fuse_hash_ops, yield hash ops per stage (3 ops)
+        - yield_batch_size: batch size for index/bounds ops (1=per op, higher=batch more)
+        - bounds_check_mode: "multiply", "select", or "mask" - how to apply bounds
         """
         T_NODE_VEC = t_base
         T_ADDR_VEC = t_base + 8
@@ -2433,26 +2486,86 @@ class GPKernelBuilderV4:
             yield ops
 
             # Step 3: XOR values with node values
-            yield [Op("valu", ("^", val_vec, val_vec, T_NODE_VEC))]
-
             # Step 4: Hash computation (6 stages)
-            for hi, (c1, c3) in enumerate(hash_consts):
-                op1, _, op2, op3, _ = HASH_STAGES[hi]
-                yield [Op("valu", (op1, T_TMP1, val_vec, c1))]
-                yield [Op("valu", (op3, T_TMP2, val_vec, c3))]
-                yield [Op("valu", (op2, val_vec, T_TMP1, T_TMP2))]
+            # fuse_hash_ops controls whether XOR is fused with hash ops
+            if fuse_hash_ops:
+                # Yield XOR + all hash ops together for maximum scheduling flexibility
+                hash_ops = [Op("valu", ("^", val_vec, val_vec, T_NODE_VEC))]
+                for hi, (c1, c3) in enumerate(hash_consts):
+                    op1, _, op2, op3, _ = HASH_STAGES[hi]
+                    hash_ops.append(Op("valu", (op1, T_TMP1, val_vec, c1)))
+                    hash_ops.append(Op("valu", (op3, T_TMP2, val_vec, c3)))
+                    hash_ops.append(Op("valu", (op2, val_vec, T_TMP1, T_TMP2)))
+                yield hash_ops
+            elif flush_per_stage:
+                # XOR separate, then hash ops per stage (3 ops at a time)
+                yield [Op("valu", ("^", val_vec, val_vec, T_NODE_VEC))]
+                for hi, (c1, c3) in enumerate(hash_consts):
+                    op1, _, op2, op3, _ = HASH_STAGES[hi]
+                    yield [
+                        Op("valu", (op1, T_TMP1, val_vec, c1)),
+                        Op("valu", (op3, T_TMP2, val_vec, c3)),
+                        Op("valu", (op2, val_vec, T_TMP1, T_TMP2))
+                    ]
+            else:
+                # XOR separate, then hash ops one at a time (finest granularity)
+                yield [Op("valu", ("^", val_vec, val_vec, T_NODE_VEC))]
+                for hi, (c1, c3) in enumerate(hash_consts):
+                    op1, _, op2, op3, _ = HASH_STAGES[hi]
+                    yield [Op("valu", (op1, T_TMP1, val_vec, c1))]
+                    yield [Op("valu", (op3, T_TMP2, val_vec, c3))]
+                    yield [Op("valu", (op2, val_vec, T_TMP1, T_TMP2))]
 
-            # Step 5: Index update
-            # idx = 2*idx + (1 if val % 2 == 0 else 2)
-            yield [Op("valu", ("%", T_TMP1, val_vec, two_vec))]
-            yield [Op("valu", ("==", T_TMP1, T_TMP1, zero_vec))]
-            yield [Op("flow", ("vselect", T_TMP2, T_TMP1, one_vec, two_vec))]
-            yield [Op("valu", ("*", idx_vec, idx_vec, two_vec))]
-            yield [Op("valu", ("+", idx_vec, idx_vec, T_TMP2))]
+            # Step 5: Index update - use GP's index_formula parameter
+            # yield_batch_size controls batching: 1=per op, higher=batch more ops
+            if index_formula == "bitwise":
+                # idx = (idx << 1) + (1 + (val & 1))
+                # Uses shift instead of multiply, direct computation of offset
+                # 4 VALU ops vs 5 for multiply_add (mod, eq, vselect, mul, add)
+                index_ops = [
+                    Op("valu", ("<<", idx_vec, idx_vec, one_vec)),  # idx << 1
+                    Op("valu", ("&", T_TMP1, val_vec, one_vec)),    # val & 1
+                    Op("valu", ("+", T_TMP1, T_TMP1, one_vec)),     # +1 -> 1 or 2
+                    Op("valu", ("+", idx_vec, idx_vec, T_TMP1)),    # idx + offset
+                ]
+            else:
+                # multiply_add: idx = 2*idx + (1 if val % 2 == 0 else 2)
+                index_ops = [
+                    Op("valu", ("%", T_TMP1, val_vec, two_vec)),
+                    Op("valu", ("==", T_TMP1, T_TMP1, zero_vec)),
+                    Op("flow", ("vselect", T_TMP2, T_TMP1, one_vec, two_vec)),
+                    Op("valu", ("*", idx_vec, idx_vec, two_vec)),
+                    Op("valu", ("+", idx_vec, idx_vec, T_TMP2)),
+                ]
+
+            # Yield index ops in batches based on yield_batch_size
+            if yield_batch_size >= len(index_ops):
+                yield index_ops
+            else:
+                for i in range(0, len(index_ops), yield_batch_size):
+                    yield index_ops[i:i + yield_batch_size]
 
             # Step 6: Bounds check - wrap to 0 if >= n_nodes
-            yield [Op("valu", ("<", T_TMP1, idx_vec, n_nodes_vec))]
-            yield [Op("flow", ("vselect", idx_vec, T_TMP1, idx_vec, zero_vec))]
+            # bounds_check_mode controls how out-of-bounds indices are handled
+            if bounds_check_mode == "select":
+                # Use vselect: idx = in_bounds ? idx : 0
+                bounds_ops = [
+                    Op("valu", ("<", T_TMP1, idx_vec, n_nodes_vec)),
+                    Op("flow", ("vselect", idx_vec, T_TMP1, idx_vec, zero_vec)),
+                ]
+            else:
+                # "multiply" or "mask": idx = idx * in_bounds_mask
+                bounds_ops = [
+                    Op("valu", ("<", T_TMP1, idx_vec, n_nodes_vec)),
+                    Op("valu", ("*", idx_vec, idx_vec, T_TMP1)),
+                ]
+
+            # Yield bounds ops in batches based on yield_batch_size
+            if yield_batch_size >= len(bounds_ops):
+                yield bounds_ops
+            else:
+                for i in range(0, len(bounds_ops), yield_batch_size):
+                    yield bounds_ops[i:i + yield_batch_size]
 
     def _compile_loop_pipelined(self, loop: LoopNode, chunk_scratch, chunks_per_round: int,
                                 rounds: int, outer_unroll: int, skip_indices: bool,
@@ -3621,7 +3734,7 @@ TEST_BATCH_SIZE = 256
 TEST_SEED = 123
 
 
-def evaluate_program(program: ProgramNode, timeout_cycles: int = 50000) -> float:
+def evaluate_program(program: ProgramNode, timeout_cycles: int = 50000, use_numba: bool = True) -> float:
     try:
         random.seed(TEST_SEED)
         forest = Tree.generate(TEST_FOREST_HEIGHT)
@@ -3632,27 +3745,48 @@ def evaluate_program(program: ProgramNode, timeout_cycles: int = 50000) -> float
         instrs = builder.build(forest.height, len(forest.values),
                                len(inp.indices), TEST_ROUNDS)
 
-        try:
-            from numba_machine import NumbaMachine
-            machine = NumbaMachine(mem, instrs)
-            machine.enable_pause = True
+        if use_numba:
+            try:
+                from numba_machine import NumbaMachine
+                machine = NumbaMachine(mem, instrs)
+                machine.enable_pause = True
 
-            ref_gen = reference_kernel2(list(mem), {})
-            ref_mem = None
-            for ref_mem in ref_gen:
-                machine.run(max_cycles=timeout_cycles)
-                if machine.cycle >= timeout_cycles:
-                    return float('inf')
+                ref_gen = reference_kernel2(list(mem), {})
+                ref_mem = None
+                for ref_mem in ref_gen:
+                    machine.run(max_cycles=timeout_cycles)
+                    if machine.cycle >= timeout_cycles:
+                        return float('inf')
 
-            if ref_mem is not None:
-                inp_values_p = ref_mem[6]
-                if list(machine.mem[inp_values_p:inp_values_p + TEST_BATCH_SIZE]) != \
-                   ref_mem[inp_values_p:inp_values_p + TEST_BATCH_SIZE]:
-                    return float('inf')
+                if ref_mem is not None:
+                    inp_values_p = ref_mem[6]
+                    if list(machine.mem[inp_values_p:inp_values_p + TEST_BATCH_SIZE]) != \
+                       ref_mem[inp_values_p:inp_values_p + TEST_BATCH_SIZE]:
+                        return float('inf')
 
-            return float(machine.cycle)
-        except ImportError:
-            return float('inf')
+                return float(machine.cycle)
+            except ImportError:
+                pass  # Fall through to pure Python
+
+        # Pure Python fallback (slower but safer)
+        machine = Machine(list(mem), instrs, builder.debug_info(), n_cores=N_CORES)
+        machine.enable_pause = True
+        machine.prints = False
+
+        ref_gen = reference_kernel2(list(mem), {})
+        ref_mem = None
+        for ref_mem in ref_gen:
+            machine.run(max_cycles=timeout_cycles)
+            if machine.cycle >= timeout_cycles:
+                return float('inf')
+
+        if ref_mem is not None:
+            inp_values_p = ref_mem[6]
+            if list(machine.mem[inp_values_p:inp_values_p + TEST_BATCH_SIZE]) != \
+               ref_mem[inp_values_p:inp_values_p + TEST_BATCH_SIZE]:
+                return float('inf')
+
+        return float(machine.cycle)
     except Exception as e:
         return float('inf')
 
@@ -3705,6 +3839,7 @@ class GeneticProgrammingV3:
         max_depth: int = 12,
         random_immigrant_rate: float = 0.1,
         use_fitness_sharing: bool = True,
+        use_numba: bool = True,
     ):
         self.population_size = population_size
         self.generations = generations
@@ -3716,6 +3851,7 @@ class GeneticProgrammingV3:
         self.max_depth = max_depth
         self.random_immigrant_rate = random_immigrant_rate
         self.use_fitness_sharing = use_fitness_sharing
+        self.use_numba = use_numba
 
         self.population: List[ProgramNode] = []
         self.fitnesses: List[float] = []
@@ -3728,7 +3864,7 @@ class GeneticProgrammingV3:
 
         # Seed with different strategies (including algorithmic optimizations)
         for seed_type in ["baseline", "minimal_flush", "max_interleave",
-                          "pipelined", "memory_optimized", "algorithmic"]:
+                          "pipelined", "memory_optimized", "algorithmic", "wave_based"]:
             self.population.append(seeded_program(seed_type))
 
         # Fill with random
@@ -3744,7 +3880,7 @@ class GeneticProgrammingV3:
     def evaluate_population(self):
         timeout = int(self.best_fitness * 1.5) if self.best_fitness < float('inf') else 50000
 
-        self.fitnesses = [evaluate_program(p, timeout) for p in self.population]
+        self.fitnesses = [evaluate_program(p, timeout, use_numba=self.use_numba) for p in self.population]
 
         if self.use_fitness_sharing:
             self.shared_fitnesses = fitness_sharing(self.fitnesses, self.population)

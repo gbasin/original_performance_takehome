@@ -1,0 +1,3 @@
+Starting GP V3: 100 individuals, 50 generations
+Extensions: Pipeline, Interleave, Memory, Unroll, Register, Phase Fusion
+

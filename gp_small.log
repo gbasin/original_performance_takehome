@@ -1,0 +1,4 @@
+Starting GP V3: 20 individuals, 5 generations
+Extensions: Pipeline, Interleave, Memory, Unroll, Register, Phase Fusion
+
+Gen   0: best=2,275, gen_best=2,275, gen_avg=5,100, valid=6/20, unique=6, time=2.7s

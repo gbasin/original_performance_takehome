@@ -144,7 +144,7 @@ def alu_op(op, v1, v2):
     return 0
 
 
-@njit(cache=True)
+@njit(cache=True, boundscheck=True)
 def run_compiled(compiled, mem, scratch, max_cycles, start_cycle, start_pc, enable_pause):
     """
     JIT-compiled execution loop.

@@ -1,0 +1,288 @@
+{
+  "best_fitness": 5199.0,
+  "best_program": {
+    "type": "Program",
+    "setup": {
+      "type": "Setup",
+      "preload_scalars": true,
+      "preload_vectors": true,
+      "preload_hash_consts": false,
+      "preload_n_nodes": true,
+      "tree_cache_depth": 1
+    },
+    "main_loop": {
+      "type": "Loop",
+      "structure": "batch_round",
+      "parallel_chunks": 32,
+      "outer_unroll": 1,
+      "chunk_unroll": 1,
+      "loop_order": "chunk_first",
+      "skip_indices": true,
+      "body": {
+        "type": "PhaseSequence",
+        "phase_order": [
+          "gather",
+          "hash",
+          "index",
+          "store"
+        ],
+        "fusion_mode": "none",
+        "gather": {
+          "type": "Gather",
+          "strategy": "batch_addr",
+          "flush_after_addr": false,
+          "flush_per_element": false,
+          "inner_unroll": 1,
+          "vector_grouping": 1,
+          "addr_compute_ahead": 0,
+          "max_addr_regs": 2,
+          "use_tree_cache": true
+        },
+        "hash": {
+          "type": "Hash",
+          "strategy": "unrolled",
+          "flush_per_stage": false,
+          "use_preloaded_consts": true,
+          "stage_unroll": [
+            1,
+            1,
+            1,
+            2
+          ],
+          "fuse_xor_with_stage1": true,
+          "cross_chunk_interleave": false
+        },
+        "index": {
+          "type": "Index",
+          "strategy": "multiply_add",
+          "flush_per_op": false,
+          "use_preloaded_consts": true,
+          "compute_unroll": 1,
+          "bounds_check_mode": "multiply",
+          "speculative": false
+        },
+        "store": {
+          "type": "Store",
+          "flush_after_addr": false,
+          "batch_stores": 1,
+          "store_order": "interleaved",
+          "write_combining": false
+        }
+      },
+      "pipeline": {
+        "type": "Pipeline",
+        "enabled": true,
+        "pipeline_depth": 2,
+        "schedule": "none",
+        "prologue_unroll": 2,
+        "epilogue_drain": true
+      },
+      "interleave": {
+        "type": "Interleave",
+        "strategy": "all_phases",
+        "lookahead_depth": 1,
+        "min_slot_fill": 0.7,
+        "allow_cross_chunk": true
+      },
+      "memory": {
+        "type": "Memory",
+        "prefetch_distance": 1,
+        "store_buffer_depth": 1,
+        "address_gen": "eager",
+        "access_order": "strided",
+        "coalesce_loads": true,
+        "coalesce_stores": true
+      },
+      "registers": {
+        "type": "Register",
+        "allocation": "dense",
+        "reuse_policy": "aggressive",
+        "spill_threshold": 512,
+        "vector_alignment": 8,
+        "reserve_temps": 4
+      }
+    }
+  },
+  "history": [
+    {
+      "generation": 0,
+      "best_fitness": 5272.0,
+      "gen_best": 5272.0,
+      "gen_avg": 7156.25,
+      "valid_count": 8,
+      "unique_strategies": 8,
+      "time": 5.893841981887817
+    },
+    {
+      "generation": 1,
+      "best_fitness": 5272.0,
+      "gen_best": 5272.0,
+      "gen_avg": 6584.285714285715,
+      "valid_count": 21,
+      "unique_strategies": 13,
+      "time": 5.916973829269409
+    },
+    {
+      "generation": 2,
+      "best_fitness": 5272.0,
+      "gen_best": 5272.0,
+      "gen_avg": 6509.9473684210525,
+      "valid_count": 38,
+      "unique_strategies": 18,
+      "time": 6.3472900390625
+    },
+    {
+      "generation": 3,
+      "best_fitness": 5272.0,
+      "gen_best": 5272.0,
+      "gen_avg": 6471.863636363636,
+      "valid_count": 44,
+      "unique_strategies": 24,
+      "time": 6.537274122238159
+    },
+    {
+      "generation": 4,
+      "best_fitness": 5231.0,
+      "gen_best": 5231.0,
+      "gen_avg": 6148.627906976744,
+      "valid_count": 43,
+      "unique_strategies": 23,
+      "time": 6.747215986251831
+    },
+    {
+      "generation": 5,
+      "best_fitness": 5231.0,
+      "gen_best": 5231.0,
+      "gen_avg": 6000.46511627907,
+      "valid_count": 43,
+      "unique_strategies": 24,
+      "time": 6.8958580493927
+    },
+    {
+      "generation": 6,
+      "best_fitness": 5231.0,
+      "gen_best": 5231.0,
+      "gen_avg": 5749.659090909091,
+      "valid_count": 44,
+      "unique_strategies": 26,
+      "time": 6.90509295463562
+    },
+    {
+      "generation": 7,
+      "best_fitness": 5231.0,
+      "gen_best": 5231.0,
+      "gen_avg": 5806.883720930233,
+      "valid_count": 43,
+      "unique_strategies": 25,
+      "time": 6.885035991668701
+    },
+    {
+      "generation": 8,
+      "best_fitness": 5231.0,
+      "gen_best": 5231.0,
+      "gen_avg": 5828.159090909091,
+      "valid_count": 44,
+      "unique_strategies": 25,
+      "time": 6.898858070373535
+    },
+    {
+      "generation": 9,
+      "best_fitness": 5231.0,
+      "gen_best": 5231.0,
+      "gen_avg": 5892.511111111111,
+      "valid_count": 45,
+      "unique_strategies": 27,
+      "time": 6.954225778579712
+    },
+    {
+      "generation": 10,
+      "best_fitness": 5199.0,
+      "gen_best": 5199.0,
+      "gen_avg": 5732.906976744186,
+      "valid_count": 43,
+      "unique_strategies": 28,
+      "time": 7.076850175857544
+    },
+    {
+      "generation": 11,
+      "best_fitness": 5199.0,
+      "gen_best": 5199.0,
+      "gen_avg": 5596.666666666667,
+      "valid_count": 45,
+      "unique_strategies": 24,
+      "time": 7.211582899093628
+    },
+    {
+      "generation": 12,
+      "best_fitness": 5199.0,
+      "gen_best": 5199.0,
+      "gen_avg": 5658.772727272727,
+      "valid_count": 44,
+      "unique_strategies": 23,
+      "time": 6.983460187911987
+    },
+    {
+      "generation": 13,
+      "best_fitness": 5199.0,
+      "gen_best": 5199.0,
+      "gen_avg": 5639.0,
+      "valid_count": 45,
+      "unique_strategies": 24,
+      "time": 7.140620708465576
+    },
+    {
+      "generation": 14,
+      "best_fitness": 5199.0,
+      "gen_best": 5199.0,
+      "gen_avg": 5690.8,
+      "valid_count": 45,
+      "unique_strategies": 30,
+      "time": 7.212861776351929
+    },
+    {
+      "generation": 15,
+      "best_fitness": 5199.0,
+      "gen_best": 5199.0,
+      "gen_avg": 5533.090909090909,
+      "valid_count": 44,
+      "unique_strategies": 24,
+      "time": 7.078113079071045
+    },
+    {
+      "generation": 16,
+      "best_fitness": 5199.0,
+      "gen_best": 5199.0,
+      "gen_avg": 5561.6,
+      "valid_count": 45,
+      "unique_strategies": 29,
+      "time": 7.278572082519531
+    },
+    {
+      "generation": 17,
+      "best_fitness": 5199.0,
+      "gen_best": 5199.0,
+      "gen_avg": 5575.733333333334,
+      "valid_count": 45,
+      "unique_strategies": 21,
+      "time": 7.542427062988281
+    },
+    {
+      "generation": 18,
+      "best_fitness": 5199.0,
+      "gen_best": 5199.0,
+      "gen_avg": 5664.822222222222,
+      "valid_count": 45,
+      "unique_strategies": 26,
+      "time": 7.860687017440796
+    },
+    {
+      "generation": 19,
+      "best_fitness": 5199.0,
+      "gen_best": 5199.0,
+      "gen_avg": 5656.711111111111,
+      "valid_count": 45,
+      "unique_strategies": 24,
+      "time": 8.108047008514404
+    }
+  ]
+}
